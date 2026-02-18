@@ -1,19 +1,19 @@
-# Generalised Coherent Elastic Cross-Section: Algorithm and Integration Guide
+# Generalized Coherent Elastic Scattering: Algorithm and Design
 
-This document explains the physics, the algorithm, and all code required to replace
-a hardcoded Bragg-edge calculator (supporting only a fixed list of lattice types) with
-a general implementation that works for any crystal structure.
+This document describes the physics, algorithm, and design of the generalized
+coherent elastic treatment implemented in `leapr_generalized.py`. The code
+handles arbitrary crystal structures (any symmetry, any number of atom species)
+and produces ENDF-6 MF7/MT2 output in either Current ENDF Format (CEF) or
+Mixed Elastic Format (MEF).
 
-The algorithm is derived from the NCrystal open-source neutron scattering library
-(T. Kittelmann et al., *Computer Physics Communications* **267** (2021) 108082).
-Specifically, the relevant NCrystal source files are:
+**References:**
 
-| NCrystal file | Role |
-|---|---|
-| `NCLatticeUtils.cc` | Reciprocal lattice matrix construction |
-| `NCFillHKL.cc` | HKL enumeration and structure factor |
-| `NCPowderBragg.cc` | Cross-section assembly |
-| `NCDefs.hh` | Physical constants |
+- K. Ramic, J. I. Damian Marquez, et al., "NJOY+NCrystal: An open-source tool
+  for creating thermal neutron scattering libraries with mixed elastic support",
+  *Nuclear Instruments and Methods in Physics Research Section A*, **1027** (2022)
+  166227.
+- T. Kittelmann et al., "Elastic neutron scattering models for NCrystal",
+  *Computer Physics Communications*, **267** (2021) 108082.
 
 ---
 
@@ -21,11 +21,11 @@ Specifically, the relevant NCrystal source files are:
 
 ### 1.1 Coherent elastic cross-section for a powder
 
-For a polycrystalline material (powder), the coherent elastic neutron cross-section
-per atom is (Squires, *Introduction to the Theory of Thermal Neutron Scattering*):
+For a polycrystalline material, the coherent elastic cross-section per atom is
+(Squires, *Introduction to the Theory of Thermal Neutron Scattering*):
 
 ```
-σ_coh_el(E) = (λ² / 4 V_atom) · Σ_{d_hkl ≥ λ/2}  mult_hkl · |F_hkl|² · d_hkl
+σ_coh_el(E) = (λ² / 4 V_atom) · Σ_{d ≥ λ/2}  mult · |F(hkl)|² · d
 ```
 
 where:
@@ -34,588 +34,322 @@ where:
 |---|---|
 | `E` | Neutron kinetic energy [eV] |
 | `λ = sqrt(WL2EKIN / E)` | Neutron wavelength [Å] |
-| `WL2EKIN = 0.081804209605330899 eV·Å²` | `ℏ²/(2 m_n)` |
+| `WL2EKIN = 0.081804209605330899 eV·Å²` | ℏ²/(2 m_n), from NCrystal/CODATA 2018 |
 | `V_atom = V_cell / N_atoms` | Volume per atom [Å³] |
-| `d_hkl` | d-spacing of plane set (h,k,l) [Å] |
-| `mult_hkl` | Crystallographic multiplicity of (h,k,l) |
-| `F_hkl` | Structure factor [√barn] |
+| `d` | d-spacing of plane set (hkl) [Å] |
+| `mult` | Crystallographic multiplicity |
+| `F(hkl)` | Structure factor [√barn] |
 
-The condition `d_hkl ≥ λ/2` means the Bragg condition can be satisfied: each new
-plane set enters as E increases past the threshold:
+Each plane set enters when E exceeds its Bragg threshold:
 
 ```
 E_threshold(d) = WL2EKIN / (4 d²)
 ```
 
-Substituting `λ² = WL2EKIN / E` gives a convenient form with a running numerator:
+The cross-section is computed as a running cumulative sum divided by energy:
 
 ```
-σ(E) = Σ_j [barn·eV] / E [eV] = fdm_cumul / E
+σ(E) = cumulative(E) / E   [barn]
 ```
 
-where each plane set contributes:
+where each plane contributes:
 
 ```
-Δ(fdm_cumul) = d · |F|² · mult · 0.5 · WL2EKIN / (V_cell · N_atoms)   [barn·eV]
+Δ = d · |F|² · mult · 0.5 · WL2EKIN / (V_cell · N_atoms)   [barn·eV]
 ```
 
 ### 1.2 Structure factor
 
+For a unit cell with multiple atom species:
+
 ```
-F(h,k,l) = Σ_{species s}  b_s [√barn] · Σ_{j ∈ s}  exp(i 2π (h·x_j + k·y_j + l·z_j))
+F(hkl) = Σ_s  b_s · f_s(hkl)
 ```
 
-- `b_s` = coherent scattering length [√barn].  To convert: `b [√barn] = b_coh_fm / 10`
-  since `1 barn = 100 fm²`.
-- `(x_j, y_j, z_j)` = fractional coordinates in the unit cell.
-- `|F|²` has units [barn].
+where `f_s(hkl) = Σ_{j ∈ species s} exp(i 2π (h·x_j + k·y_j + l·z_j))` is the
+per-species geometric form factor, and `b_s` is the coherent scattering length
+in √barn (`b_coh_fm / 10`).
 
-### 1.3 Debye-Waller (how it is handled here)
+The squared structure factor:
 
-The Debye-Waller factor `exp(-2W)` where `W = ½ k² · MSD` attenuates the
-structure factor at high momentum transfer.  The present algorithm stores
-**temperature-independent** per-plane contributions (DW = 1, same as NJOY's
-internal `coher` subroutine with `wint = 0`).  The output stage applies an
-average DW via `dwpix` (computed from the phonon spectrum) as it writes to ENDF,
-exactly as in the original LEAPR code.
+```
+|F|² = |Σ_s b_s · f_s|² = Σ_{s,t} b_s b_t · Re[f_s · f_t*]
+```
 
-If full per-species, per-temperature DW is needed in the future, each
-`AtomSite` already carries a `b_coh_fm` field; a `msd` field and a
-`Debye-Waller(T)` property can be added to `AtomSite` without changing any
-other interface.
+### 1.3 Debye-Waller factor — per-species treatment
+
+The Bragg-edge calculator stores **temperature-independent** per-plane
+contributions (DW = 1). The Debye-Waller attenuation is applied when building
+the ENDF output, using **per-species** DW factors from partial phonon spectra.
+
+For a single effective DW parameter `w`, the standard ENDF accumulation is:
+
+```
+cumulative += exp(-4 w E_j) · Δ_j
+```
+
+For per-species DW (as implemented), the DW is applied inside the species sum:
+
+```
+δ_j(T) = scale × Σ_{s,t} b_s · b_t · exp(-2(W_s + W_t) · E_j) · D_{st,j}
+```
+
+where:
+- `W_s = dwpix_s / (awr_s × T × kB)` is the per-species ENDF DW parameter [1/eV]
+- `dwpix_s` is the raw DW lambda from the partial phonon spectrum for species `s`
+- `D_{st,j}` is the per-species correlation matrix (see Section 3)
+- `scale` depends on the elastic mode (CEF or MEF)
+
+This matches NCrystal's approach, where each atom type in the structure factor
+gets its own DW exponent `exp(-W_i · q²/2)`. The result is ~0.03% agreement
+with NCrystal reference data for SiC.
+
+Note: when all species have the same W, the per-species formula reduces to
+`exp(-4W·E) · Δ`, recovering the standard single-DW behavior exactly.
 
 ---
 
-## 2. Output Data Format Contract
+## 2. Per-Species Correlation Matrix
 
-The function produces a 2-column NumPy array `bragg_data`:
+The Bragg-edge calculator (`compute_bragg_edges_general`) optionally returns a
+per-species correlation matrix alongside the standard `bragg_data` array. This
+is activated by `per_species=True`.
+
+For each Bragg edge `j`, the correlation matrix is:
 
 ```
-bragg_data[:, 0]  = E_threshold [eV]     — ascending
-bragg_data[:, 1]  = σ_contribution [barn·eV]  — per plane-group, NO DW
+D_{st,j} = d_j · C_{st,j} · mult_j · xsectfact
 ```
 
-The ENDF writer accumulates these at output time:
+where `C_{st}(hkl) = Re[f_s(hkl) · f_t*(hkl)]` is the geometric correlation
+between species `s` and `t` (form factors WITHOUT scattering lengths).
 
-```python
-# for temperature itemp with DW parameter w = dwpix[itemp]:
-cumulative = 0.0
-for j in range(nbe):
-    cumulative += exp(-4 * w * bragg_data[j, 0]) * bragg_data[j, 1]
-    # write pair: (bragg_data[j, 0], cumulative)
+The relationship to the standard output:
+
+```
+Δ_j = bragg_data[j, 1] = Σ_{s,t} b_s · b_t · D_{st,j}
 ```
 
-The cumulative value [barn·eV] divided by energy [eV] gives the cross-section [barn].
-
-The last row is a sentinel: `bragg_data[-1, 0] == emax` with the same
-σ as the previous row, matching LEAPR convention.
+The returned `species_corr` array has shape `(nbe, nspecies, nspecies)`.
 
 ---
 
-## 3. New Data Structures
+## 3. Elastic Modes: CEF and MEF
 
-These must be defined **before** the input-parameters class so that
-`crystal_structure: Optional[CrystalStructure] = None` can be used as a field.
+### 3.1 CEF — Current ENDF Format (elastic_mode=1)
+
+The CEF approach stores elastic scattering in the existing ENDF LTHR=1/2 format.
+One atom is designated the **Dominant Channel (DC) atom** and carries the
+coherent elastic Bragg edges; other atoms receive incoherent elastic with a
+redistribution correction.
+
+**Single atom (nat=1):**
+- If σ_coh > σ_inc: LTHR=1 (coherent), scale = (σ_coh + σ_inc) / σ_coh
+- If σ_inc > σ_coh: LTHR=2 (incoherent), scale = (σ_coh + σ_inc) / σ_inc
+
+**Polyatomic (nat>1):**
+- DC atom selection: minimize `f_i/(1-f_i) × σ_inc_i` over all atom types
+- DC atom tape: LTHR=1, cumulative S scaled by `1/f_DC`
+- Non-DC atom tapes: LTHR=2, SB = σ_inc × redistribution factor
+  - Redistribution: `[1 + f_DC/(1-f_DC) × σ_inc_DC/σ_inc_i]`
+
+### 3.2 MEF — Mixed Elastic Format (elastic_mode=2)
+
+The MEF approach uses LTHR=3, which stores both coherent and incoherent elastic
+in a single MF7/MT2 section. Every atom gets the same treatment:
+
+- **Coherent part**: Bragg edges per atom (no DC scaling, shared across all atoms)
+- **Incoherent part**: SB = σ_inc of the principal scatterer, Wp = per-species DW
+
+For polyatomic materials, both atoms produce the **same** Bragg edge table
+(since the coherent cross-section is per-atom, not per-species), but different
+SB and Wp values.
+
+---
+
+## 4. Algorithm: Bragg-Edge Calculation
+
+### 4.1 Overview
+
+The `compute_bragg_edges_general()` function replaces the hardcoded `coher()`
+subroutine. It handles any crystal symmetry and any number of atom species.
+The algorithm follows NCrystal (`NCFillHKL.cc` + `NCPowderBragg.cc`).
+
+### 4.2 Steps
+
+1. **Reciprocal lattice matrix**: `G = _get_reciprocal_lattice_matrix(a, b, c,
+   α, β, γ)` maps Miller indices to k-vectors. Analytic special cases for
+   cubic/tetragonal/orthorhombic, hexagonal, and monoclinic; general triclinic
+   falls back to `G = 2π · L⁻¹`.
+
+2. **HKL enumeration**: NCrystal convention — enumerate the positive half of
+   reciprocal space (h≥0; h=0→k≥0; h=k=0→l>0). Each (h,k,l) represents its
+   Friedel pair, so initial multiplicity = 2.
+
+3. **Structure factor**: For each (h,k,l), compute per-species form factors
+   f_s and total F² = |Σ_s b_s · f_s|². Optionally compute the correlation
+   matrix C_{st} = Re[f_s · f_t*].
+
+4. **Multiplicity grouping**: Planes with the same d-spacing AND F² are merged,
+   accumulating multiplicity. This naturally discovers crystallographic
+   multiplicity for any symmetry.
+
+5. **Energy assembly**: Convert d-spacing to E_threshold, multiply by xsectfact,
+   sort ascending, merge near-degenerate energies.
+
+6. **Emax sentinel**: Append a final entry at emax (LEAPR/NJOY convention).
+
+### 4.3 Data structures
 
 ```python
-from dataclasses import dataclass
-from typing import List, Tuple
-import numpy as np
-
-
 @dataclass
 class AtomSite:
-    """One distinct atom species in the unit cell.
-
-    Args:
-        b_coh_fm:  Coherent scattering length [fm].
-                   NIST 2018 values: C=6.646, Be=7.79, O=5.803, Al=3.449,
-                                     Pb=9.405, Fe=9.45, Si=4.1491, N=9.36, …
-        positions: List of (x, y, z) fractional coordinates for each atom
-                   of this species within the unit cell.
-    """
-    b_coh_fm: float
-    positions: List[Tuple[float, float, float]]
-
-    @property
-    def b_coh_sqrtbarn(self) -> float:
-        """Scattering length in √barn  (1 barn = 100 fm²)."""
-        return self.b_coh_fm / 10.0
-
+    b_coh_fm: float                          # coherent scattering length [fm]
+    positions: List[Tuple[float, float, float]]  # fractional coordinates
 
 @dataclass
 class CrystalStructure:
-    """Full crystal structure description for Bragg-edge calculation.
-
-    Args:
-        a, b, c:              Lattice parameters [Å].
-        alpha, beta, gamma:   Lattice angles [degrees].
-                              Convention: alpha between b and c,
-                                          beta  between a and c,
-                                          gamma between a and b.
-        sites:                One AtomSite per distinct species.
-    """
-    a: float
-    b: float
-    c: float
-    alpha: float
-    beta:  float
-    gamma: float
-    sites: List[AtomSite]
-
-    @property
-    def n_atoms(self) -> int:
-        """Total atoms per unit cell."""
-        return sum(len(s.positions) for s in self.sites)
-
-    @property
-    def volume(self) -> float:
-        """Unit-cell volume [Å³]."""
-        ca = np.cos(np.radians(self.alpha))
-        cb = np.cos(np.radians(self.beta))
-        cg = np.cos(np.radians(self.gamma))
-        return (self.a * self.b * self.c *
-                np.sqrt(max(0.0, 1.0 - ca**2 - cb**2 - cg**2 + 2.0*ca*cb*cg)))
+    a, b, c: float           # lattice constants [Å]
+    alpha, beta, gamma: float  # lattice angles [degrees]
+    sites: List[AtomSite]    # one per distinct species
 ```
 
 ---
 
-## 4. Physical Constant
+## 5. Input Cards for Generalized Elastic (iel=10)
 
-```python
-# WL2EKIN = ℏ²/(2 m_n)  [eV·Å²]
-# Neutron kinetic energy: E = WL2EKIN / λ²  (λ in Å, E in eV)
-# Source: NCrystal NCDefs.hh
-WL2EKIN = 0.081804209605330899
+When `iel=10` on Card 5, additional cards are read after Card 6:
+
+### Card 6b — Elastic mode and atom counts
+
 ```
+elastic_mode  nat  nspec  /
+```
+
+| Parameter | Values |
+|---|---|
+| `elastic_mode` | 1 = CEF (LTHR=1/2), 2 = MEF (LTHR=3) |
+| `nat` | Number of distinct atom types in the unit cell |
+| `nspec` | Number of partial phonon spectra to follow |
+
+### Card 6c — Lattice parameters
+
+```
+a  b  c  alpha  beta  gamma  /
+```
+
+Lattice constants in Å, angles in degrees.
+
+### Card 6d — Atom types (repeated nat times)
+
+```
+Z  A  awr  b_coh  sigma_inc  npos  /
+x1 y1 z1  x2 y2 z2  ...  /
+```
+
+| Field | Description |
+|---|---|
+| `Z, A` | Atomic and mass number |
+| `awr` | Atomic weight ratio to neutron |
+| `b_coh` | Coherent scattering length [fm] |
+| `sigma_inc` | Incoherent cross section [barns] |
+| `npos` | Number of positions in the unit cell |
+| `x y z` | Fractional coordinates (npos × 3 values) |
+
+### Card 6e — Partial phonon spectra (repeated nspec times)
+
+```
+Z  A  delta  ni  /
+rho(1) rho(2) ... rho(ni)  /
+```
+
+Matched to atom types by (Z, A). Used to compute per-species DW factors.
 
 ---
 
-## 5. Reciprocal Lattice Matrix
+## 6. Per-Species DW Computation
 
-`get_reciprocal_lattice_matrix` maps integer Miller indices to Cartesian k-vectors:
+The `_compute_per_species_msd()` function computes the DW lambda for each atom
+type from its partial phonon spectrum, using the same method as LEAPR's `start()`
+function:
 
-```
-k_vec [Å⁻¹] = G [3×3, Å⁻¹] @ [h, k, l]
-d-spacing: d = 2π / |k_vec|
-```
+1. Transform phonon DOS: `p[j] = rho[j] / (β · 2sinh(β/2))`
+2. Normalize: `p[j] /= fsum(1, p, ni, τ, Δβ)`
+3. Compute DW lambda: `dwpix_s = fsum(0, p, ni, τ, Δβ)`
 
-Algorithm mirrors `NCLatticeUtils.cc::getReciprocalLatticeRot`.
-Special analytic cases are handled before the general `G = 2π L⁻¹` path.
+The ENDF DW parameter is then: `W_s = dwpix_s / (awr_s × T × kB)`
 
-```python
-def get_reciprocal_lattice_matrix(a: float, b: float, c: float,
-                                   alpha_deg: float, beta_deg: float,
-                                   gamma_deg: float) -> np.ndarray:
-    """
-    Returns 3×3 numpy array G [Å⁻¹] such that k_vec = G @ [h, k, l].
-    """
-    tol  = 1e-10
-    k2pi = 2.0 * np.pi
-    alpha = np.radians(alpha_deg)
-    beta  = np.radians(beta_deg)
-    gamma = np.radians(gamma_deg)
+For SiC at 293.15 K:
+- Si: dwpix = 0.889947, W = 1.265220 [1/eV]
+- C:  dwpix = 0.463835, W = 1.541939 [1/eV]
 
-    a90  = abs(alpha - np.pi / 2) < tol
-    b90  = abs(beta  - np.pi / 2) < tol
-    g90  = abs(gamma - np.pi / 2) < tol
-    g120 = abs(gamma - 2 * np.pi / 3) < tol
-
-    if a90 and b90 and g90:
-        # Cubic / tetragonal / orthorhombic
-        return np.diag([k2pi / a, k2pi / b, k2pi / c])
-
-    if a90 and b90 and g120:
-        # Hexagonal
-        sq3 = np.sqrt(3.0)
-        return np.array([
-            [k2pi / a,           0.0,                    0.0   ],
-            [k2pi / (a * sq3),   2.0 * k2pi / (b * sq3), 0.0  ],
-            [0.0,                0.0,                    k2pi/c],
-        ])
-
-    if a90 and g90:
-        # Monoclinic (β ≠ 90°)
-        sb   = np.sin(beta)
-        cotb = np.cos(beta) / sb
-        return np.array([
-            [k2pi / a,          0.0,          0.0          ],
-            [0.0,               k2pi / b,     0.0          ],
-            [-cotb * k2pi / a,  0.0,          k2pi/(c*sb)  ],
-        ])
-
-    # General triclinic:  G = 2π · L⁻¹
-    ca, cb, cg = np.cos(alpha), np.cos(beta), np.cos(gamma)
-    sb, sg     = np.sin(beta),  np.sin(gamma)
-    m57 = c * (ca - cb * cg) / sg
-    m88 = c * np.sqrt(max(0.0, sb**2 - ((ca - cb * cg) / sg)**2))
-    L = np.array([
-        [a,    b * cg,  c * cb],
-        [0.0,  b * sg,  m57   ],
-        [0.0,  0.0,     m88   ],
-    ])
-    return k2pi * np.linalg.inv(L)
-```
+The lighter carbon atom has a larger W (more thermal displacement) than the
+heavier silicon atom, as expected physically.
 
 ---
 
-## 6. Core Algorithm: `compute_bragg_edges_general`
+## 7. ENDF Output Builders
 
-This function is the direct replacement for the old hardcoded Bragg-edge calculator.
-It is self-contained: it only requires `WL2EKIN`,
-`get_reciprocal_lattice_matrix`, and `CrystalStructure`/`AtomSite`.
+### `_build_cef_coherent` — LTHR=1
+
+Builds the coherent elastic Bragg edge table with per-species DW:
 
 ```python
-def compute_bragg_edges_general(
-    crystal: CrystalStructure,
-    emax:       float,
-    dcutoff:    float = 0.5,
-    fsquarecut: float = 1e-5,
-    merge_tol:  float = 1e-4,
-) -> Tuple[np.ndarray, int]:
-    """
-    Compute Bragg-edge data for an arbitrary crystal structure.
-
-    Based on NCrystal (NCFillHKL.cc + NCPowderBragg.cc).
-
-    Parameters
-    ----------
-    crystal     : CrystalStructure
-    emax        : Maximum Bragg-edge energy [eV]
-    dcutoff     : Minimum d-spacing to consider [Å]  (default 0.5 Å)
-    fsquarecut  : Minimum |F|² to keep a plane [barn]  (default 1e-5)
-    merge_tol   : Relative tolerance for grouping planes with the same d
-
-    Returns
-    -------
-    bragg_data  : ndarray, shape (N, 2)
-                  col 0 = E_threshold [eV],  col 1 = σ_contribution [barn·eV]
-                  Sorted ascending in energy. Last row is Emax sentinel.
-    nbe         : int  — number of rows in bragg_data
-    """
-    V = crystal.volume   # [Å³]
-    N = crystal.n_atoms  # atoms per unit cell
-
-    # Cross-section prefactor  [eV/Å]
-    # d[Å] · F²[barn] · mult · xsectfact  =  σ_plane [barn·eV]
-    xsectfact = 0.5 * WL2EKIN / (V * N)
-
-    # Reciprocal lattice matrix  k_vec = G @ [h, k, l]
-    G = get_reciprocal_lattice_matrix(
-        crystal.a, crystal.b, crystal.c,
-        crystal.alpha, crystal.beta, crystal.gamma,
-    )
-
-    # |k|² upper bound from dcutoff  (d ≥ dcutoff  ⟺  |k| ≤ 2π/dcutoff)
-    ksq_max = (2.0 * np.pi / dcutoff) ** 2
-
-    # Conservative Miller-index search bounds  (a/dcutoff gives the rough maximum)
-    h_max = max(1, int(np.ceil(crystal.a / dcutoff)) + 1)
-    k_max = max(1, int(np.ceil(crystal.b / dcutoff)) + 1)
-    l_max = max(1, int(np.ceil(crystal.c / dcutoff)) + 1)
-
-    # Precompute scattering lengths and position arrays
-    sites_data = [
-        (s.b_coh_sqrtbarn, np.asarray(s.positions, dtype=float))
-        for s in crystal.sites
-    ]
-
-    # ------------------------------------------------------------------ #
-    # HKL enumeration (NCrystal convention):                               #
-    #   h ≥ 0                                                              #
-    #   h = 0  →  k ≥ 0                                                   #
-    #   h = k = 0  →  l > 0                                               #
-    # Each (h,k,l) represents the Friedel pair {(h,k,l), (-h,-k,-l)},    #
-    # so multiplicity starts at 2.                                          #
-    # ------------------------------------------------------------------ #
-    plane_list = []   # entries: [d, F², mult=2]
-
-    for h in range(0, h_max + 1):
-        k_lo = 0 if h == 0 else -k_max
-        for k in range(k_lo, k_max + 1):
-            l_lo = 1 if (h == 0 and k == 0) else -l_max
-            for l in range(l_lo, l_max + 1):
-
-                k_vec = G @ np.array([h, k, l], dtype=float)
-                ksq   = float(np.dot(k_vec, k_vec))
-
-                if ksq < 1e-30 or ksq > ksq_max:
-                    continue
-
-                d     = 2.0 * np.pi / np.sqrt(ksq)   # [Å]
-                E_thr = WL2EKIN / (4.0 * d * d)       # [eV]
-                if E_thr > emax:
-                    continue
-
-                # Structure factor
-                # F(h,k,l) = Σ_species b_s · Σ_j exp(i 2π (h xj + k yj + l zj))
-                real_part = 0.0
-                imag_part = 0.0
-                for b_s, pos in sites_data:
-                    phase = 2.0 * np.pi * (
-                        h * pos[:, 0] + k * pos[:, 1] + l * pos[:, 2]
-                    )
-                    real_part += b_s * np.sum(np.cos(phase))
-                    imag_part += b_s * np.sum(np.sin(phase))
-
-                F2 = real_part**2 + imag_part**2   # [barn]
-                if F2 < fsquarecut:
-                    continue   # systematic absence or negligible
-
-                plane_list.append([d, F2, 2])
-
-    if not plane_list:
-        return np.array([]).reshape(0, 2), 0
-
-    # ------------------------------------------------------------------ #
-    # Group planes that share the same d AND F²                            #
-    # This naturally accumulates multiplicity for higher-symmetry systems: #
-    #   e.g. FCC (100),(010),(001) all have the same d and F² → mult = 6  #
-    # ------------------------------------------------------------------ #
-    plane_list.sort(key=lambda x: -x[0])   # descending d = ascending E
-
-    groups = []   # [d_rep, F2_rep, mult_total]
-    for d, F2, mult in plane_list:
-        merged = False
-        for grp in groups:
-            d_g, F2_g = grp[0], grp[1]
-            if (abs(d - d_g) / d_g < merge_tol and
-                    abs(F2 - F2_g) / max(F2_g, 1e-30) < merge_tol):
-                grp[2] += mult
-                merged = True
-                break
-        if not merged:
-            groups.append([d, F2, mult])
-
-    # Build output pairs (E_threshold, σ_plane [barn·eV])
-    pairs = []
-    for d, F2, mult in groups:
-        E_thr = WL2EKIN / (4.0 * d * d)
-        sigma = d * F2 * mult * xsectfact
-        pairs.append([E_thr, sigma])
-
-    pairs.sort(key=lambda p: p[0])
-
-    # Merge pairs with nearly identical energies
-    TOLER = 1e-6
-    combined = []
-    for E, sig in pairs:
-        if combined and (E - combined[-1][0]) < TOLER:
-            combined[-1][1] += sig
-        else:
-            combined.append([E, sig])
-
-    bragg_data = np.array(combined, dtype=float)
-    nbe = bragg_data.shape[0]
-
-    # Append Emax sentinel (LEAPR/NJOY convention)
-    if nbe > 0 and bragg_data[-1, 0] < emax:
-        bragg_data = np.vstack([bragg_data, [emax, bragg_data[-1, 1]]])
-        nbe += 1
-
-    return bragg_data, nbe
+def _edge_delta(j, itemp, energy=None):
+    """DW-weighted edge contribution."""
+    e = energy if energy is not None else bragg[j][0]
+    delta = 0.0
+    for si in range(nsp):
+        for ti in range(nsp):
+            dw = exp(-2.0 * (W_ps[si][itemp] + W_ps[ti][itemp]) * e)
+            delta += b_sqb[si] * b_sqb[ti] * dw * species_corr[j, si, ti]
+    return delta * scale
 ```
+
+Falls back to single-DW `exp(-4w·E) · Δ` when species_corr is not available.
+
+### `_build_cef_incoherent` — LTHR=2
+
+Stores SB (bound cross section with optional redistribution factor) and Wp
+(DW parameter of the principal scatterer, from `dwpix_out`).
+
+### `_build_mef_elastic` — LTHR=3
+
+Combines coherent Bragg edges (with per-species DW, same as CEF) and incoherent
+elastic (SB = σ_inc of principal, Wp = principal's DW) in one section.
 
 ---
 
-## 7. Convenience Factory: `crystal_from_lat`
+## 8. Validation
 
-Provides backward compatibility with LEAPR's `lat = 1..6` convention.
-Returns a `CrystalStructure` for each hardcoded lattice type so that
-existing workflows that set `lat` can be migrated transparently.
+Tested against NCrystal reference ENDF files for β-SiC (F-43m, a=4.348 Å,
+4 Si + 4 C atoms per unit cell) at 293.15 K:
 
-```python
-def crystal_from_lat(lat: int) -> CrystalStructure:
-    """
-    Build a CrystalStructure for one of the six classic LEAPR lattice types.
-    Scattering lengths are NIST 2018 values.
+| Case | LTHR | Metric | Our Value | Reference | Difference |
+|------|------|--------|-----------|-----------|------------|
+| C in SiC (CEF) | 1 | Final cumulative S | 1.313574 | 1.313143 | 0.033% |
+| Si in SiC (CEF) | 2 | SB [barns] | 0.005 | 0.005 | exact |
+| Si in SiC (CEF) | 2 | Wp [1/eV] | 1.265220 | 1.265463 | 0.019% |
+| C in SiC (MEF) | 3 | Final cumulative S | 0.656787 | 0.656571 | 0.033% |
+| C in SiC (MEF) | 3 | Wp [1/eV] | 1.541939 | 1.542509 | 0.037% |
+| Si in SiC (MEF) | 3 | Wp [1/eV] | 1.265220 | 1.265463 | 0.019% |
 
-    lat=1  Graphite (hexagonal P6₃/mmc)
-    lat=2  Beryllium (hexagonal P6₃/mmc)
-    lat=3  Beryllium oxide (wurtzite P6₃mc)
-    lat=4  Aluminium (FCC Fm-3m)
-    lat=5  Lead (FCC Fm-3m)
-    lat=6  Iron (BCC Im-3m)
-    """
-    if lat == 1:
-        return CrystalStructure(
-            a=2.4573, b=2.4573, c=6.700,
-            alpha=90.0, beta=90.0, gamma=120.0,
-            sites=[AtomSite(
-                b_coh_fm=6.646,   # C
-                positions=[(0.0, 0.0, 0.0), (0.0, 0.0, 0.5),
-                           (1/3, 2/3, 0.0), (2/3, 1/3, 0.5)],
-            )],
-        )
-    elif lat == 2:
-        return CrystalStructure(
-            a=2.2856, b=2.2856, c=3.5832,
-            alpha=90.0, beta=90.0, gamma=120.0,
-            sites=[AtomSite(
-                b_coh_fm=7.79,    # Be
-                positions=[(0.0, 0.0, 0.0), (1/3, 2/3, 0.5)],
-            )],
-        )
-    elif lat == 3:
-        return CrystalStructure(
-            a=2.695, b=2.695, c=4.39,
-            alpha=90.0, beta=90.0, gamma=120.0,
-            sites=[
-                AtomSite(b_coh_fm=7.79,
-                         positions=[(0.0, 0.0, 0.0), (1/3, 2/3, 0.5)]),      # Be
-                AtomSite(b_coh_fm=5.803,
-                         positions=[(0.0, 0.0, 0.375), (1/3, 2/3, 0.875)]),  # O
-            ],
-        )
-    elif lat == 4:
-        return CrystalStructure(
-            a=4.04, b=4.04, c=4.04,
-            alpha=90.0, beta=90.0, gamma=90.0,
-            sites=[AtomSite(
-                b_coh_fm=3.449,   # Al
-                positions=[(0.0, 0.0, 0.0), (0.0, 0.5, 0.5),
-                           (0.5, 0.0, 0.5), (0.5, 0.5, 0.0)],
-            )],
-        )
-    elif lat == 5:
-        return CrystalStructure(
-            a=4.94, b=4.94, c=4.94,
-            alpha=90.0, beta=90.0, gamma=90.0,
-            sites=[AtomSite(
-                b_coh_fm=9.405,   # Pb
-                positions=[(0.0, 0.0, 0.0), (0.0, 0.5, 0.5),
-                           (0.5, 0.0, 0.5), (0.5, 0.5, 0.0)],
-            )],
-        )
-    elif lat == 6:
-        return CrystalStructure(
-            a=2.86, b=2.86, c=2.86,
-            alpha=90.0, beta=90.0, gamma=90.0,
-            sites=[AtomSite(
-                b_coh_fm=9.45,    # Fe
-                positions=[(0.0, 0.0, 0.0), (0.5, 0.5, 0.5)],
-            )],
-        )
-    else:
-        raise ValueError(f"Unknown lat={lat}. Use 1..6 or supply CrystalStructure directly.")
-```
+The MEF cumulative S (0.656787) is exactly half the CEF DC-atom value
+(1.313574 / 2), confirming correct per-atom normalization.
+
+Mono-atomic materials (Al FCC, Fe BCC, graphite hexagonal) also verified
+with iel=10 inputs against standard iel=1-6 outputs.
 
 ---
 
-## 8. Integration: What Changes in the Host Codebase
-
-### 8.1 Input parameters class
-
-Add one optional field to whatever class holds run parameters:
-
-```python
-crystal_structure: Optional[CrystalStructure] = None
-# When set, this takes precedence over any legacy `lat` integer flag.
-```
-
-### 8.2 Bragg-edge dispatcher
-
-Replace the body of the function that decides *which* Bragg-edge calculator
-to call with this routing logic:
-
-```python
-def process_coherent_elastic(self, emax: float) -> Optional[Tuple[np.ndarray, int]]:
-    params = self.params   # or however you access the run parameters
-
-    crystal = getattr(params, 'crystal_structure', None)
-    if crystal is not None:
-        bragg_data, nbe = compute_bragg_edges_general(crystal, emax)
-    elif getattr(params, 'lat', 0) != 0:
-        bragg_data, nbe = compute_bragg_edges_legacy(params.lat, params.natom, emax)
-    else:
-        return None   # coherent elastic not requested
-
-    # --- whatever post-processing (thinning, DW, output) was done before ---
-    bragg_data, nbe = thin_bragg_edges(bragg_data, ...)
-    return bragg_data, nbe
-```
-
-### 8.3 ENDF / output writer (no change required)
-
-The `bragg_data` array produced by `compute_bragg_edges_general` has exactly
-the same format as the old hardcoded function — per-plane contributions in
-`[barn·eV]` without Debye-Waller.  Any downstream accumulation loop of the form:
-
-```python
-cumulative += exp(-4 * w * E) * sigma
-```
-
-continues to work unchanged.
-
----
-
-## 9. Usage Examples
-
-### Example A — drop-in replacement for lat=4 (Aluminium)
-
-```python
-# Old way:
-bragg_data, nbe = compute_bragg_edges(lat=4, natom=4, emax=5.0)
-
-# New way — identical crystal, general algorithm:
-crystal = crystal_from_lat(4)
-bragg_data, nbe = compute_bragg_edges_general(crystal, emax=5.0)
-```
-
-### Example B — arbitrary crystal (e.g. silicon)
-
-```python
-silicon = CrystalStructure(
-    a=5.4307, b=5.4307, c=5.4307,
-    alpha=90.0, beta=90.0, gamma=90.0,
-    sites=[AtomSite(
-        b_coh_fm=4.1491,   # Si (NIST 2018)
-        positions=[
-            (0.00, 0.00, 0.00), (0.50, 0.50, 0.00),
-            (0.50, 0.00, 0.50), (0.00, 0.50, 0.50),
-            (0.25, 0.25, 0.25), (0.75, 0.75, 0.25),
-            (0.75, 0.25, 0.75), (0.25, 0.75, 0.75),
-        ],
-    )],
-)
-bragg_data, nbe = compute_bragg_edges_general(silicon, emax=5.0)
-```
-
-### Example C — multi-species crystal (e.g. SiC wurtzite)
-
-```python
-sic = CrystalStructure(
-    a=3.073, b=3.073, c=5.053,
-    alpha=90.0, beta=90.0, gamma=120.0,
-    sites=[
-        AtomSite(b_coh_fm=4.1491,   # Si
-                 positions=[(0.0, 0.0, 0.0), (1/3, 2/3, 0.5)]),
-        AtomSite(b_coh_fm=6.646,    # C
-                 positions=[(0.0, 0.0, 0.375), (1/3, 2/3, 0.875)]),
-    ],
-)
-bragg_data, nbe = compute_bragg_edges_general(sic, emax=5.0)
-```
-
----
-
-## 10. Key Design Decisions and Limitations
+## 9. Design Decisions
 
 | Decision | Rationale |
 |---|---|
-| DW not in F² | Matches NJOY `coher` (wint=0). DW applied at output via dwpix. |
-| mult=2 per enumerated (h,k,l) | Counts Friedel pair; extra symmetry emerges from grouping by (d, F²). |
-| Conservative h/k/l bounds | `ceil(a/dcutoff)+1` is always safe; slight over-enumeration is fast with early-exit. |
-| Per-plane σ [barn·eV] | Same unit and format as legacy function; ENDF writer needs no changes. |
-| Last row = Emax sentinel | Required by LEAPR convention for the output thinning algorithm. |
-
-**Limitations to be aware of:**
-- For multi-species materials, the single average DW from `dwpix` is an
-  approximation.  If per-species MSD data are available (e.g. from `calc_msd.py`),
-  the DW can be incorporated directly into F² by multiplying each `b_s` by
-  `exp(-0.5 * k² * msd_s)` inside the structure factor sum; this would require
-  a separate `bragg_data` per temperature and a corresponding change to the writer.
-- The multiplicity counting from the (d, F²) grouping is exact for Laue classes
-  that are already covered by the chosen HKL half-space.  For space groups with
-  true absences (glide planes, screw axes), the structure factor goes to zero and
-  the `fsquarecut` filter removes those planes automatically.
+| DW not stored in bragg_data | Temperature-independent Bragg edges allow reuse across temperatures. DW applied at output time. |
+| Per-species DW inside structure factor sum | Matches NCrystal exactly. A single effective DW gives ~3-6% error for polyatomic materials. |
+| Species correlation matrix D_{st} | Avoids recomputing Bragg edges for per-species DW. Returned alongside bragg_data when `per_species=True`. |
+| mult=2 per enumerated (h,k,l) | Counts Friedel pair; additional symmetry emerges from grouping by (d, F²). |
+| Conservative h/k/l bounds | `ceil(a/dcutoff)+1` is always safe; slight over-enumeration is fast with early-exit on |k|². |
+| Self-contained in leapr_generalized.py | No external module dependencies. Bragg-edge calculator, data structures, and builders all inlined. |
+| Legacy coher() preserved | Backward compatibility with iel=1-6 hardcoded materials. |

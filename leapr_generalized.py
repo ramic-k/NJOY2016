@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Python translation of the NJOY2016 LEAPR module.
+Python translation of the NJOY2016 LEAPR module with generalized elastic
+scattering for arbitrary crystal structures.
 
 Calculates the thermal neutron scattering law S(alpha, beta) using the
 phonon expansion method. Supports:
@@ -8,7 +9,12 @@ phonon expansion method. Supports:
   - Free-gas and diffusion translational modes
   - Discrete oscillators
   - Cold hydrogen/deuterium (ortho/para)
-  - Coherent elastic (Bragg edges) for graphite, Be, BeO, Al, Pb, Fe
+  - Coherent elastic (Bragg edges) for graphite, Be, BeO, Al, Pb, Fe (iel=1-6)
+  - Generalized coherent elastic for arbitrary crystals (iel=10)
+      * CEF: Current ENDF Format (elastic_mode=1)
+      * MEF: Mixed Elastic Format (elastic_mode=2, LTHR=3)
+      * Per-species Debye-Waller factors from partial phonon spectra
+      * Polyatomic unit cells with DC-atom selection (Ramic et al., NIM-A 1027, 2022)
   - Incoherent elastic
   - Mixed moderators (secondary scatterers)
   - Skold approximation for intermolecular coherence
@@ -16,7 +22,108 @@ phonon expansion method. Supports:
 Output is written in ENDF-6 MF7/MT4 format using endf-parserpy.
 
 Usage:
-    python leapr.py <input_file> <output_file>
+    python leapr_generalized.py <input_file> <output_file>
+
+
+Generalized Elastic Input Cards (iel=10)
+=========================================
+
+When iel=10 is specified on Card 5, additional input cards are read after
+Card 6 (secondary scatterer control) to define the crystal structure and
+elastic scattering treatment. These cards follow the formalism described in:
+
+    K. Ramic, J. I. Damian Marquez, et al., "NJOY+NCrystal: An open-source
+    tool for creating thermal neutron scattering libraries with mixed elastic
+    support", NIM-A 1027 (2022) 166227.
+
+Card 6b — Elastic mode and atom counts
+---------------------------------------
+    elastic_mode  nat  nspec  /
+
+    elastic_mode  1 = CEF (Current ENDF Format)
+                      - Dominant-channel (DC) atom gets LTHR=1 (coherent)
+                      - Other atoms get LTHR=2 (incoherent) with redistribution
+                      - For single-atom materials: σ_coh vs σ_inc determines channel
+                  2 = MEF (Mixed Elastic Format)
+                      - All atoms get LTHR=3 (both coherent + incoherent)
+                      - Coherent part: per-atom Bragg edges
+                      - Incoherent part: per-atom σ_inc and DW factor
+    nat           Number of distinct atom types in the unit cell (>= 1)
+    nspec         Number of partial phonon spectra to follow
+
+Card 6c — Lattice parameters
+-----------------------------
+    a  b  c  alpha  beta  gamma  /
+
+    a, b, c         Lattice constants [Angstrom]
+    alpha, beta, gamma  Lattice angles [degrees]
+                        (alpha=b^c, beta=a^c, gamma=a^b)
+
+Card 6d — Atom types (repeated nat times)
+------------------------------------------
+  For each atom type i = 1, ..., nat:
+
+    Z_i  A_i  awr_i  b_coh_i  sigma_inc_i  npos_i  /
+    x1 y1 z1  x2 y2 z2  ...  (npos_i positions)  /
+
+    Z_i           Atomic number
+    A_i           Mass number
+    awr_i         Atomic weight ratio (to neutron mass)
+    b_coh_i       Coherent scattering length [fm]
+    sigma_inc_i   Incoherent scattering cross section [barns]
+    npos_i        Number of positions of this atom in the unit cell
+    x y z         Fractional coordinates of each position
+
+Card 6e — Partial phonon spectra (repeated nspec times)
+--------------------------------------------------------
+  For each spectrum s = 1, ..., nspec:
+
+    Z_s  A_s  delta_s  ni_s  /
+    rho(1) rho(2) ... rho(ni_s)  /
+
+    Z_s, A_s      Identifies which atom type this spectrum belongs to
+                  (matched to Card 6d entries by Z and A)
+    delta_s       Energy grid spacing [eV]
+    ni_s          Number of phonon spectrum values
+    rho(j)        Phonon density of states on equidistant grid
+
+  These spectra are used to compute per-species Debye-Waller factors.
+  Each atom type should have a matching partial spectrum; unmatched atom
+  types fall back to the principal scatterer's DW factor.
+
+
+Example Input — C in SiC (CEF, polyatomic)
+============================================
+
+  leapr
+  20
+  'C in SiC-beta (generalized CEF iel=10)'/
+  1 1 100 /                          --- Card 3: ntempr=1, iprint=1, nphon=100
+  101 6012./                          --- Card 4: mat=101, za=6012 (C-12)
+  11.907856 4.724629 1 10 0/         --- Card 5: awr, spr, npr=1, iel=10, ncold=0
+  0/                                  --- Card 6: nss=0 (no secondary scatterer)
+  1 2 2/                              --- Card 6b: CEF, 2 atom types, 2 spectra
+  4.348 4.348 4.348 90. 90. 90./     --- Card 6c: cubic SiC, a=4.348 Angstrom
+  14 28 27.844241 4.1491 0.004 4/    --- Card 6d[1]: Si-28, b_coh=4.15 fm, 4 pos
+  0 0 0  0 0.5 0.5  0.5 0 0.5  0.5 0.5 0/
+  6 12 11.907856 6.646 0.001 4/      --- Card 6d[2]: C-12, b_coh=6.65 fm, 4 pos
+  0.25 0.25 0.25  0.25 0.75 0.75  0.75 0.25 0.75  0.75 0.75 0.25/
+  14 28 3.899867e-04 301/            --- Card 6e[1]: Si partial phonon DOS
+  0.0 2.784318e-05 ... /
+  6 12 3.899867e-04 301/             --- Card 6e[2]: C partial phonon DOS
+  0.0 3.045983e-06 ... /
+  366 367 1/                          --- Card 7: nalpha, nbeta, lat
+  ...                                 --- Cards 8-14: alpha, beta, T, rho, etc.
+  /
+  stop
+
+  In this example:
+    - The principal scatterer is C-12 (za=6012)
+    - SiC has space group F-43m with 4 Si + 4 C atoms per unit cell
+    - CEF selects C as the DC atom (lower σ_inc contribution)
+    - The C tape gets LTHR=1 (coherent elastic, scaled by 1/f_DC = 2.0)
+    - A separate run with za=14028 gives Si its LTHR=2 (incoherent elastic)
+    - For MEF: change Card 6b to "2 2 2/" — both tapes get LTHR=3
 """
 
 import os
@@ -31,10 +138,283 @@ from math import sqrt, exp, log, pi, sin, cos, isinf
 import sys
 import copy
 
-from coherent_elastic_general import (
-    AtomSite, CrystalStructure,
-    compute_bragg_edges_general,
-)
+from dataclasses import dataclass
+from typing import List, Tuple
+
+# ============================================================================
+# Coherent elastic (Bragg-edge) calculator for polycrystalline materials
+# (inlined from coherent_elastic_general.py)
+#
+# Algorithm based on NCrystal:
+#   T. Kittelmann et al., Computer Physics Communications 267 (2021) 108082
+# ============================================================================
+
+# WL2EKIN = ℏ²/(2 m_n)  [eV·Å²]   (CODATA 2018, from NCrystal NCDefs.hh)
+WL2EKIN: float = 0.081804209605330899
+
+
+@dataclass
+class AtomSite:
+    """One distinct atom species occupying one or more sites in the unit cell.
+
+    Parameters
+    ----------
+    b_coh_fm : float
+        Coherent scattering length [fm].
+    positions : list of (x, y, z)
+        Fractional coordinates of each atom of this species in the unit cell.
+    """
+    b_coh_fm: float
+    positions: List[Tuple[float, float, float]]
+
+    @property
+    def b_coh_sqrtbarn(self) -> float:
+        """Coherent scattering length in √barn  (1 barn = 100 fm²)."""
+        return self.b_coh_fm / 10.0
+
+
+@dataclass
+class CrystalStructure:
+    """Full crystal structure description.
+
+    Parameters
+    ----------
+    a, b, c : float
+        Lattice parameters [Å].
+    alpha, beta, gamma : float
+        Lattice angles [degrees].
+    sites : list of AtomSite
+        One entry per distinct atom species.
+    """
+    a: float
+    b: float
+    c: float
+    alpha: float
+    beta:  float
+    gamma: float
+    sites: List[AtomSite]
+
+    @property
+    def n_atoms(self) -> int:
+        return sum(len(s.positions) for s in self.sites)
+
+    @property
+    def volume(self) -> float:
+        """Unit-cell volume [Å³]."""
+        ca = np.cos(np.radians(self.alpha))
+        cb = np.cos(np.radians(self.beta))
+        cg = np.cos(np.radians(self.gamma))
+        return (self.a * self.b * self.c *
+                np.sqrt(max(0.0, 1.0 - ca**2 - cb**2 - cg**2 + 2.0*ca*cb*cg)))
+
+
+def _get_reciprocal_lattice_matrix(a, b, c, alpha_deg, beta_deg, gamma_deg):
+    """Compute the 3×3 reciprocal lattice matrix G.
+
+    G maps integer Miller indices to Cartesian k-vectors:
+        k_vec [Å⁻¹] = G @ [h, k, l]
+        d-spacing [Å] = 2π / |k_vec|
+
+    Algorithm mirrors NCrystal NCLatticeUtils.cc (getReciprocalLatticeRot).
+    """
+    tol  = 1e-10
+    k2pi = 2.0 * np.pi
+    alpha = np.radians(alpha_deg)
+    beta  = np.radians(beta_deg)
+    gamma = np.radians(gamma_deg)
+
+    a90  = abs(alpha - np.pi / 2) < tol
+    b90  = abs(beta  - np.pi / 2) < tol
+    g90  = abs(gamma - np.pi / 2) < tol
+    g120 = abs(gamma - 2 * np.pi / 3) < tol
+
+    if a90 and b90 and g90:
+        return np.diag([k2pi / a, k2pi / b, k2pi / c])
+
+    if a90 and b90 and g120:
+        sq3 = np.sqrt(3.0)
+        return np.array([
+            [k2pi / a,             0.0,                    0.0    ],
+            [k2pi / (a * sq3),  2.0 * k2pi / (b * sq3),   0.0    ],
+            [0.0,               0.0,                    k2pi / c  ],
+        ])
+
+    if a90 and g90:
+        sb   = np.sin(beta)
+        cotb = np.cos(beta) / sb
+        return np.array([
+            [k2pi / a,            0.0,        0.0          ],
+            [0.0,                 k2pi / b,   0.0          ],
+            [-cotb * k2pi / a,    0.0,        k2pi/(c*sb)  ],
+        ])
+
+    # General triclinic
+    ca, cb, cg = np.cos(alpha), np.cos(beta), np.cos(gamma)
+    sb, sg     = np.sin(beta),  np.sin(gamma)
+    m57 = c * (ca - cb * cg) / sg
+    m88 = c * np.sqrt(max(0.0, sb**2 - ((ca - cb * cg) / sg)**2))
+    L = np.array([
+        [a,    b * cg,  c * cb],
+        [0.0,  b * sg,  m57   ],
+        [0.0,  0.0,     m88   ],
+    ])
+    return k2pi * np.linalg.inv(L)
+
+
+def compute_bragg_edges_general(
+    crystal, emax, dcutoff=0.5, fsquarecut=1e-5, merge_tol=1e-4,
+    per_species=False,
+):
+    """Compute Bragg-edge cross-section data for any polycrystalline material.
+
+    Returns
+    -------
+    bragg_data : ndarray, shape (N, 2)
+        Column 0: Bragg-edge energy E_threshold [eV], ascending.
+        Column 1: Per-plane-group cross-section contribution [barn·eV]
+                  (Debye-Waller NOT included).
+    nbe : int
+        Number of rows in bragg_data.
+    species_corr : ndarray or None
+        If per_species=True, shape (nbe, nspecies, nspecies).
+    """
+    V = crystal.volume
+    N = crystal.n_atoms
+
+    if V <= 0.0:
+        raise ValueError(f"Non-positive unit-cell volume {V:.6g} Å³.")
+    if N == 0:
+        raise ValueError("Crystal has no atom sites.")
+
+    xsectfact = 0.5 * WL2EKIN / (V * N)
+
+    G = _get_reciprocal_lattice_matrix(
+        crystal.a, crystal.b, crystal.c,
+        crystal.alpha, crystal.beta, crystal.gamma,
+    )
+
+    ksq_max = (2.0 * np.pi / dcutoff) ** 2
+
+    h_max = max(1, int(np.ceil(crystal.a / dcutoff)) + 1)
+    k_max = max(1, int(np.ceil(crystal.b / dcutoff)) + 1)
+    l_max = max(1, int(np.ceil(crystal.c / dcutoff)) + 1)
+
+    sites_data = [
+        (s.b_coh_sqrtbarn, np.asarray(s.positions, dtype=float))
+        for s in crystal.sites
+    ]
+    nspecies = len(crystal.sites)
+
+    plane_list = []
+
+    for h in range(0, h_max + 1):
+        k_lo = 0 if h == 0 else -k_max
+        for k in range(k_lo, k_max + 1):
+            l_lo = 1 if (h == 0 and k == 0) else -l_max
+            for l in range(l_lo, l_max + 1):
+
+                k_vec = G @ np.array([h, k, l], dtype=float)
+                ksq   = float(np.dot(k_vec, k_vec))
+
+                if ksq < 1e-30 or ksq > ksq_max:
+                    continue
+
+                d     = 2.0 * np.pi / np.sqrt(ksq)
+                E_thr = WL2EKIN / (4.0 * d * d)
+                if E_thr > emax:
+                    continue
+
+                form_real = np.empty(nspecies)
+                form_imag = np.empty(nspecies)
+                for si, (_, pos) in enumerate(sites_data):
+                    phase = 2.0 * np.pi * (
+                        h * pos[:, 0] + k * pos[:, 1] + l * pos[:, 2]
+                    )
+                    form_real[si] = float(np.sum(np.cos(phase)))
+                    form_imag[si] = float(np.sum(np.sin(phase)))
+
+                real_part = 0.0
+                imag_part = 0.0
+                for si in range(nspecies):
+                    real_part += sites_data[si][0] * form_real[si]
+                    imag_part += sites_data[si][0] * form_imag[si]
+
+                F2 = real_part**2 + imag_part**2
+
+                if F2 < fsquarecut:
+                    continue
+
+                C_st = None
+                if per_species:
+                    C_st = (np.outer(form_real, form_real) +
+                            np.outer(form_imag, form_imag))
+
+                plane_list.append([d, F2, 2.0, C_st])
+
+    if not plane_list:
+        if per_species:
+            return (np.empty((0, 2), dtype=float), 0,
+                    np.empty((0, nspecies, nspecies), dtype=float))
+        return np.empty((0, 2), dtype=float), 0
+
+    plane_list.sort(key=lambda x: -x[0])
+
+    groups = []
+    for d, F2, mult, C_st in plane_list:
+        merged = False
+        for grp in groups:
+            d_g, F2_g = grp[0], grp[1]
+            if (abs(d   - d_g)  /      d_g         < merge_tol and
+                abs(F2  - F2_g) / max(F2_g, 1e-30) < merge_tol):
+                grp[2] += mult
+                merged = True
+                break
+        if not merged:
+            groups.append([d, F2, mult, C_st])
+
+    pairs = []
+    for d, F2, mult, C_st in groups:
+        E_thr = WL2EKIN / (4.0 * d * d)
+        sigma = d * F2 * mult * xsectfact
+        D_st = None
+        if per_species and C_st is not None:
+            D_st = d * C_st * mult * xsectfact
+        pairs.append([E_thr, sigma, D_st])
+
+    pairs.sort(key=lambda p: p[0])
+
+    TOLER = 1e-6
+    combined = []
+    for E, sig, D_st in pairs:
+        if combined and (E - combined[-1][0]) < TOLER:
+            combined[-1][1] += sig
+            if per_species and D_st is not None and combined[-1][2] is not None:
+                combined[-1][2] = combined[-1][2] + D_st
+        else:
+            combined.append([E, sig,
+                             D_st.copy() if D_st is not None else None])
+
+    bragg_data = np.array([[e[0], e[1]] for e in combined], dtype=float)
+    nbe = int(bragg_data.shape[0])
+
+    species_corr = None
+    if per_species:
+        species_corr = np.zeros((nbe, nspecies, nspecies), dtype=float)
+        for j, entry in enumerate(combined):
+            if entry[2] is not None:
+                species_corr[j] = entry[2]
+
+    if nbe > 0 and bragg_data[-1, 0] < emax:
+        bragg_data = np.vstack([bragg_data, [emax, bragg_data[-1, 1]]])
+        if species_corr is not None:
+            species_corr = np.concatenate(
+                [species_corr, species_corr[-1:]], axis=0)
+        nbe += 1
+
+    if per_species:
+        return bragg_data, nbe, species_corr
+    return bragg_data, nbe
+
 
 # ============================================================================
 # Physical constants (matching NJOY2016 physics module exactly)
@@ -2560,7 +2940,7 @@ def _build_generalized_elastic(mat, za, awr, bragg, nedge, ntempr, tempr,
     """Build MF7/MT2 for generalized elastic (iel=10).
 
     Implements both CEF (elastic_mode=1) and MEF (elastic_mode=2) following
-    the paper: Ramic et al., NIM-A 1027 (2022) 166227.
+    the paper: K. Ramic, J. I. Damian Marquez, et al., NIM-A 1027 (2022) 166227.
 
     For CEF:
       - Single atom (nat=1): Eq 24/25 — store dominant channel, scale by
@@ -2600,7 +2980,8 @@ def _build_generalized_elastic(mat, za, awr, bragg, nedge, ntempr, tempr,
             print(f"  CEF single atom: coherent approx, "
                   f"scale={(sigma_coh_p + sigma_inc_p):.4f}/{sigma_coh_p:.4f} = {scale:.4f}")
             return _build_cef_coherent(mat, za, awr, bragg, nedge, ntempr,
-                                        tempr, dwpix_out, scale)
+                                        tempr, dwpix_out, scale,
+                                        crystal_info=crystal_info)
         else:
             # Incoherent approximation (Eq 25)
             # Scale SB by (σ_coh + σ_inc) / σ_inc
@@ -2619,7 +3000,8 @@ def _build_generalized_elastic(mat, za, awr, bragg, nedge, ntempr, tempr,
         print(f"  CEF polyatomic: principal is DC atom, "
               f"scale=1/f_DC=1/{f_dc:.4f}={scale:.4f}")
         return _build_cef_coherent(mat, za, awr, bragg, nedge, ntempr,
-                                    tempr, dwpix_out, scale)
+                                    tempr, dwpix_out, scale,
+                                    crystal_info=crystal_info)
     else:
         # Principal scatterer is NOT the DC atom → LTHR=2 (incoherent elastic)
         # with redistribution factor from Eq 26
@@ -2639,15 +3021,54 @@ def _build_generalized_elastic(mat, za, awr, bragg, nedge, ntempr, tempr,
 
 
 def _build_cef_coherent(mat, za, awr, bragg, nedge, ntempr, tempr,
-                         dwpix_out, scale):
+                         dwpix_out, scale, crystal_info=None):
     """Build LTHR=1 (coherent elastic) section with a multiplicative scale.
 
     The scale factor accounts for:
     - Single atom CEF: (σ_coh + σ_inc)/σ_coh  (Eq 24)
     - Polyatomic CEF DC atom: 1/f_DC  (Eq 26)
+
+    If crystal_info with species_corr is provided, per-species Debye-Waller
+    factors are applied inside the structure factor (matching NCrystal):
+        δ_j = scale × Σ_{s,t} b_s b_t exp(-2(W_s+W_t) E_j) D_{st,j}
+    where W_s = dwpix_s / (awr_s T kB) is the per-species ENDF DW parameter.
     """
     tol = 0.9e-7
 
+    # --- Per-species DW setup ---
+    use_ps = (crystal_info is not None and
+              'species_corr' in crystal_info and
+              crystal_info['species_corr'] is not None)
+
+    if use_ps:
+        atom_types = crystal_info['atom_types']
+        sc = crystal_info['species_corr']   # (nedge+1, nsp, nsp)
+        nsp = len(atom_types)
+        # b_coh in sqrt(barn) = b_coh_fm / 10
+        b_sqb = [at['b_coh'] / 10.0 for at in atom_types]
+        # W_s[si][itemp] = dwpix_s / (awr_s × T × kB)  [1/eV]
+        W_ps = [[at['dwpix'][it] / (at['awr'] * tempr[it] * BK)
+                 for it in range(ntempr)] for at in atom_types]
+
+        print(f"    Per-species DW (ENDF W, 1/eV) at T={tempr[0]:.2f}K:")
+        for si, at in enumerate(atom_types):
+            print(f"      {at['Z']}-{at['A']}: W={W_ps[si][0]:.6f}")
+
+    def _edge_delta(j, itemp, energy=None):
+        """DW-weighted edge contribution at temperature itemp."""
+        e = energy if energy is not None else bragg[j][0]
+        if use_ps:
+            delta = 0.0
+            for si in range(nsp):
+                w_si = W_ps[si][itemp]
+                for ti in range(nsp):
+                    dw = exp(-2.0 * (w_si + W_ps[ti][itemp]) * e)
+                    delta += b_sqb[si] * b_sqb[ti] * dw * sc[j, si, ti]
+            return delta * scale
+        else:
+            return exp(-4.0 * dwpix_out[itemp] * e) * bragg[j][1] * scale
+
+    # --- Build ENDF dict ---
     mf7mt2 = {}
     mf7mt2['MAT'] = mat
     mf7mt2['MF'] = 7
@@ -2658,15 +3079,15 @@ def _build_cef_coherent(mat, za, awr, bragg, nedge, ntempr, tempr,
     mf7mt2['T0'] = tempr[0]
     mf7mt2['LT'] = ntempr - 1
 
-    # Thin out negligible edges at first temperature
-    w0 = dwpix_out[0]
-
+    # Thin out negligible edges at first temperature and cache deltas
+    deltas_T0 = []
     total_sum = 0.0
     suml = 0.0
     jmax = 0
     for j in range(nedge):
-        e = bragg[j][0]
-        total_sum += exp(-4.0 * w0 * e) * bragg[j][1] * scale
+        d = _edge_delta(j, 0)
+        deltas_T0.append(d)
+        total_sum += d
         if total_sum - suml > tol * total_sum:
             jmax = j + 1
             suml = total_sum
@@ -2682,13 +3103,12 @@ def _build_cef_coherent(mat, za, awr, bragg, nedge, ntempr, tempr,
     s_cumulative = []
     s = 0.0
     for j in range(nedge):
-        e = bragg[j][0]
-        s += exp(-4.0 * w0 * e) * bragg[j][1] * scale
+        s += deltas_T0[j]
         if j < jmax:
-            energies.append(sigfig(e, 7, 0))
+            energies.append(sigfig(bragg[j][0], 7, 0))
             s_cumulative.append(sigfig(s, 7, 0))
         else:
-            energies[-1] = sigfig(e, 7, 0)
+            energies[-1] = sigfig(bragg[j][0], 7, 0)
             s_cumulative[-1] = sigfig(s, 7, 0)
 
     mf7mt2['S_T0_table']['Eint'] = energies
@@ -2703,15 +3123,13 @@ def _build_cef_coherent(mat, za, awr, bragg, nedge, ntempr, tempr,
         for i in range(1, ntempr):
             mf7mt2['T'][i] = tempr[i]
 
-            w = dwpix_out[i]
-
             s = 0.0
             jj = 0
             for j in range(nedge):
                 if j < jmax:
                     jj = j
                 e_sf = sigfig(bragg[jj][0], 7, 0)
-                s += exp(-4.0 * w * e_sf) * bragg[jj][1] * scale
+                s += _edge_delta(jj, i, energy=e_sf)
                 mf7mt2['S'][jj + 1][i] = sigfig(s, 7, 0)
 
     return mf7mt2
@@ -2768,16 +3186,40 @@ def _build_mef_elastic(mat, za, awr, bragg, nedge, ntempr, tempr,
     mf7mt2['AWR'] = awr
     mf7mt2['LTHR'] = 3  # mixed elastic
 
-    # --- Coherent elastic part (Bragg edges, per-atom average) ---
-    # No extra scaling: compute_bragg_edges_general already returns per-atom
-    w0 = dwpix_out[0]
+    # --- Per-species DW setup (same as CEF) ---
+    use_ps = ('species_corr' in crystal_info and
+              crystal_info['species_corr'] is not None)
 
+    if use_ps:
+        atom_types = crystal_info['atom_types']
+        sc = crystal_info['species_corr']
+        nsp = len(atom_types)
+        b_sqb = [at['b_coh'] / 10.0 for at in atom_types]
+        W_ps = [[at['dwpix'][it] / (at['awr'] * tempr[it] * BK)
+                 for it in range(ntempr)] for at in atom_types]
+
+    def _edge_delta(j, itemp, energy=None):
+        e = energy if energy is not None else bragg[j][0]
+        if use_ps:
+            delta = 0.0
+            for si in range(nsp):
+                w_si = W_ps[si][itemp]
+                for ti in range(nsp):
+                    dw = exp(-2.0 * (w_si + W_ps[ti][itemp]) * e)
+                    delta += b_sqb[si] * b_sqb[ti] * dw * sc[j, si, ti]
+            return delta
+        else:
+            return exp(-4.0 * dwpix_out[itemp] * e) * bragg[j][1]
+
+    # --- Coherent elastic part (Bragg edges, per-atom average) ---
+    deltas_T0 = []
     total_sum = 0.0
     suml = 0.0
     jmax = 0
     for j in range(nedge):
-        e = bragg[j][0]
-        total_sum += exp(-4.0 * w0 * e) * bragg[j][1]
+        d = _edge_delta(j, 0)
+        deltas_T0.append(d)
+        total_sum += d
         if total_sum - suml > tol * total_sum:
             jmax = j + 1
             suml = total_sum
@@ -2795,13 +3237,12 @@ def _build_mef_elastic(mat, za, awr, bragg, nedge, ntempr, tempr,
     s_cumulative = []
     s = 0.0
     for j in range(nedge):
-        e = bragg[j][0]
-        s += exp(-4.0 * w0 * e) * bragg[j][1]
+        s += deltas_T0[j]
         if j < jmax:
-            energies.append(sigfig(e, 7, 0))
+            energies.append(sigfig(bragg[j][0], 7, 0))
             s_cumulative.append(sigfig(s, 7, 0))
         else:
-            energies[-1] = sigfig(e, 7, 0)
+            energies[-1] = sigfig(bragg[j][0], 7, 0)
             s_cumulative[-1] = sigfig(s, 7, 0)
 
     mf7mt2['S_T0_table']['Eint'] = energies
@@ -2814,7 +3255,6 @@ def _build_mef_elastic(mat, za, awr, bragg, nedge, ntempr, tempr,
 
         for i in range(1, ntempr):
             mf7mt2['T'][i] = tempr[i]
-            w = dwpix_out[i]
 
             s = 0.0
             jj = 0
@@ -2822,7 +3262,7 @@ def _build_mef_elastic(mat, za, awr, bragg, nedge, ntempr, tempr,
                 if j < jmax:
                     jj = j
                 e_sf = sigfig(bragg[jj][0], 7, 0)
-                s += exp(-4.0 * w * e_sf) * bragg[jj][1]
+                s += _edge_delta(jj, i, energy=e_sf)
                 mf7mt2['S'][jj + 1][i] = sigfig(s, 7, 0)
 
     # --- Incoherent elastic part ---
@@ -3207,13 +3647,15 @@ def run_leapr(input_file, output_file):
     if iel == 10 and crystal_info is not None:
         # Generalized Bragg edge calculation
         # Compute dcutoff from emax: d_min = sqrt(WL2EKIN / (4*emax))
-        from coherent_elastic_general import WL2EKIN
+
         emax_bragg = 5.0
         dcutoff = sqrt(WL2EKIN / (4.0 * emax_bragg)) * 0.95  # 5% margin
-        bragg_data, nedge = compute_bragg_edges_general(
-            crystal_info['crystal'], emax=emax_bragg, dcutoff=dcutoff)
+        bragg_data, nedge, species_corr = compute_bragg_edges_general(
+            crystal_info['crystal'], emax=emax_bragg, dcutoff=dcutoff,
+            per_species=True)
         # Convert from numpy array to list of (E, delta) tuples
         bragg = [(bragg_data[i, 0], bragg_data[i, 1]) for i in range(nedge)]
+        crystal_info['species_corr'] = species_corr
         print(f"  Generalized: found {nedge} Bragg edges below 5 eV")
 
         # Compute per-species MSD from partial phonon spectra

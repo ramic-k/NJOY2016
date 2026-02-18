@@ -2,14 +2,25 @@
 
 ## Project Overview
 
-This project contains `leapr.py`, a complete Python reimplementation of NJOY2016's
-`leapr.f90` Fortran module. LEAPR calculates thermal neutron scattering law
-S(alpha, beta) from phonon frequency distributions and writes output in ENDF-6
-format (MF7/MT4 for inelastic, MF7/MT2 for elastic).
+This project contains two Python LEAPR implementations:
 
-The Fortran source is at `src/leapr.f90` (~3,600 lines). The Python translation
-is `leapr.py` (~2,714 lines), using NumPy for performance-critical inner loops
-and `endf_parserpy` for ENDF-6 file output.
+- **`leapr.py`** — Direct translation of NJOY2016's `leapr.f90`. Supports the
+  standard LEAPR input format with hardcoded coherent elastic for six materials
+  (graphite, Be, BeO, Al, Pb, Fe).
+
+- **`leapr_generalized.py`** — Extended version with generalized coherent elastic
+  scattering for arbitrary crystal structures (`iel=10`). Self-contained (no
+  external module dependencies beyond NumPy and endf-parserpy). Implements the
+  formalism from K. Ramic, J. I. Damian Marquez, et al., NIM-A 1027 (2022) 166227.
+
+Both calculate the thermal neutron scattering law S(alpha, beta) from phonon
+frequency distributions and write output in ENDF-6 format (MF7/MT4 for inelastic,
+MF7/MT2 for elastic).
+
+The Fortran source is at `src/leapr.f90` (~3,600 lines). The base Python
+translation is `leapr.py` (~2,714 lines). The generalized version is
+`leapr_generalized.py` (~3,600 lines), which includes all base functionality
+plus the Bragg-edge calculator and generalized elastic builders.
 
 ## Dependencies
 
@@ -21,11 +32,12 @@ and `endf_parserpy` for ENDF-6 file output.
 ## Usage
 
 ```bash
-python leapr.py <input_file> [output_file]
+python leapr.py <input_file> <output_file>              # standard LEAPR
+python leapr_generalized.py <input_file> <output_file>  # with iel=10 support
 ```
 
 - `input_file`: NJOY-format LEAPR input deck (same format as Fortran NJOY)
-- `output_file`: defaults to `leapr_output.endf` if omitted
+- `output_file`: ENDF-6 output file path
 
 ## Architecture
 
@@ -256,6 +268,80 @@ Key variable name correspondences between `leapr.f90` and `leapr.py`:
 | `dwp1(i)` | `dwp1[i]` | Saved principal DW coefficient |
 | `tempr(i)` | `tempr[i]` | Requested temperatures |
 | `arat` | `arat` | Mass ratio (awr_secondary / awr_principal) for alpha scaling |
+
+## Generalized Coherent Elastic (iel=10)
+
+### Overview
+
+`leapr_generalized.py` extends LEAPR with generalized coherent elastic scattering
+for arbitrary crystal structures. This is activated by setting `iel=10` on Card 5,
+which triggers additional input cards (6b-6e) that define the crystal structure,
+atom types, and partial phonon spectra.
+
+The implementation follows:
+  K. Ramic, J. I. Damian Marquez, et al., "NJOY+NCrystal: An open-source tool
+  for creating thermal neutron scattering libraries with mixed elastic support",
+  NIM-A 1027 (2022) 166227.
+
+### Elastic Modes
+
+- **CEF (elastic_mode=1)**: Current ENDF Format
+  - Single atom: dominant channel (coherent or incoherent) approximation (Eq 24/25)
+  - Polyatomic: DC atom gets LTHR=1 scaled by 1/f_DC; others get LTHR=2 with
+    redistribution factor (Eq 26)
+- **MEF (elastic_mode=2)**: Mixed Elastic Format
+  - All atoms get LTHR=3 (coherent + incoherent in one section)
+  - Coherent part: per-atom Bragg edges (shared across all atoms in the crystal)
+  - Incoherent part: per-atom σ_inc and Debye-Waller parameter
+
+### Key Implementation Details
+
+- **Bragg-edge calculator**: Inlined from `coherent_elastic_general.py`. Handles
+  any crystal symmetry (triclinic through cubic), multiple atom species, systematic
+  absences, and crystallographic multiplicity. Algorithm follows NCrystal
+  (Kittelmann et al., CPC 267, 2021).
+
+- **Per-species Debye-Waller factors**: Each atom type gets its own DW parameter
+  W_s = dwpix_s / (awr_s × T × kB), computed from partial phonon spectra. The DW
+  is applied per species inside the structure factor:
+  ```
+  δ_j(T) = scale × Σ_{s,t} b_s b_t exp(-2(W_s + W_t) E_j) D_{st,j}
+  ```
+  This matches NCrystal's approach and gives ~0.03% agreement with NCrystal
+  reference data for SiC.
+
+- **DC atom selection**: For CEF polyatomic, the dominant-channel atom minimizes
+  f_i/(1-f_i) × σ_inc_i across all atom types.
+
+- **Species correlation matrix**: `compute_bragg_edges_general()` returns per-species
+  correlation matrices D_{st,j} when `per_species=True`, enabling the per-species
+  DW treatment without recomputing Bragg edges.
+
+### Generalized Elastic Functions
+
+| Function | Purpose |
+|----------|---------|
+| `compute_bragg_edges_general()` | General Bragg-edge calculator for any crystal |
+| `_compute_per_species_msd()` | Per-species DW lambda from partial phonon spectra |
+| `_build_generalized_elastic()` | Router: dispatches to CEF or MEF builders |
+| `_build_cef_coherent()` | LTHR=1 with per-species DW and scale factor |
+| `_build_cef_incoherent()` | LTHR=2 for non-DC atoms in CEF |
+| `_build_mef_elastic()` | LTHR=3 (coherent + incoherent) |
+
+### Validation
+
+Tested against NCrystal reference ENDF files for SiC (F-43m, a=4.348 Å):
+
+| Case | LTHR | Metric | Difference |
+|------|------|--------|------------|
+| C in SiC (CEF) | 1 | Cumulative S | 0.033% max |
+| Si in SiC (CEF) | 2 | SB | exact |
+| Si in SiC (CEF) | 2 | Wp | 0.019% |
+| C in SiC (MEF) | 3 | Cumulative S | 0.033% max |
+| C in SiC (MEF) | 3 | Wp | 0.037% |
+| Si in SiC (MEF) | 3 | Wp | 0.019% |
+
+Mono-atomic materials (Al, Fe, graphite) also verified with iel=10 inputs.
 
 ## Potential Future Work
 

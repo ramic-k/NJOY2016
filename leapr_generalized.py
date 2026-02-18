@@ -263,7 +263,6 @@ def _get_reciprocal_lattice_matrix(a, b, c, alpha_deg, beta_deg, gamma_deg):
 
 def compute_bragg_edges_general(
     crystal, emax, dcutoff=0.5, fsquarecut=1e-5, merge_tol=1e-4,
-    per_species=False,
 ):
     """Compute Bragg-edge cross-section data for any polycrystalline material.
 
@@ -275,8 +274,8 @@ def compute_bragg_edges_general(
                   (Debye-Waller NOT included).
     nbe : int
         Number of rows in bragg_data.
-    species_corr : ndarray or None
-        If per_species=True, shape (nbe, nspecies, nspecies).
+    species_corr : ndarray, shape (nbe, nspecies, nspecies)
+        Per-species correlation matrix for Debye-Waller application.
     """
     V = crystal.volume
     N = crystal.n_atoms
@@ -344,18 +343,14 @@ def compute_bragg_edges_general(
                 if F2 < fsquarecut:
                     continue
 
-                C_st = None
-                if per_species:
-                    C_st = (np.outer(form_real, form_real) +
-                            np.outer(form_imag, form_imag))
+                C_st = (np.outer(form_real, form_real) +
+                        np.outer(form_imag, form_imag))
 
                 plane_list.append([d, F2, 2.0, C_st])
 
     if not plane_list:
-        if per_species:
-            return (np.empty((0, 2), dtype=float), 0,
-                    np.empty((0, nspecies, nspecies), dtype=float))
-        return np.empty((0, 2), dtype=float), 0
+        return (np.empty((0, 2), dtype=float), 0,
+                np.empty((0, nspecies, nspecies), dtype=float))
 
     plane_list.sort(key=lambda x: -x[0])
 
@@ -376,9 +371,7 @@ def compute_bragg_edges_general(
     for d, F2, mult, C_st in groups:
         E_thr = WL2EKIN / (4.0 * d * d)
         sigma = d * F2 * mult * xsectfact
-        D_st = None
-        if per_species and C_st is not None:
-            D_st = d * C_st * mult * xsectfact
+        D_st = d * C_st * mult * xsectfact
         pairs.append([E_thr, sigma, D_st])
 
     pairs.sort(key=lambda p: p[0])
@@ -388,32 +381,24 @@ def compute_bragg_edges_general(
     for E, sig, D_st in pairs:
         if combined and (E - combined[-1][0]) < TOLER:
             combined[-1][1] += sig
-            if per_species and D_st is not None and combined[-1][2] is not None:
-                combined[-1][2] = combined[-1][2] + D_st
+            combined[-1][2] = combined[-1][2] + D_st
         else:
-            combined.append([E, sig,
-                             D_st.copy() if D_st is not None else None])
+            combined.append([E, sig, D_st.copy()])
 
     bragg_data = np.array([[e[0], e[1]] for e in combined], dtype=float)
     nbe = int(bragg_data.shape[0])
 
-    species_corr = None
-    if per_species:
-        species_corr = np.zeros((nbe, nspecies, nspecies), dtype=float)
-        for j, entry in enumerate(combined):
-            if entry[2] is not None:
-                species_corr[j] = entry[2]
+    species_corr = np.zeros((nbe, nspecies, nspecies), dtype=float)
+    for j, entry in enumerate(combined):
+        species_corr[j] = entry[2]
 
     if nbe > 0 and bragg_data[-1, 0] < emax:
         bragg_data = np.vstack([bragg_data, [emax, bragg_data[-1, 1]]])
-        if species_corr is not None:
-            species_corr = np.concatenate(
-                [species_corr, species_corr[-1:]], axis=0)
+        species_corr = np.concatenate(
+            [species_corr, species_corr[-1:]], axis=0)
         nbe += 1
 
-    if per_species:
-        return bragg_data, nbe, species_corr
-    return bragg_data, nbe
+    return bragg_data, nbe, species_corr
 
 
 # ============================================================================
@@ -3651,8 +3636,7 @@ def run_leapr(input_file, output_file):
         emax_bragg = 5.0
         dcutoff = sqrt(WL2EKIN / (4.0 * emax_bragg)) * 0.95  # 5% margin
         bragg_data, nedge, species_corr = compute_bragg_edges_general(
-            crystal_info['crystal'], emax=emax_bragg, dcutoff=dcutoff,
-            per_species=True)
+            crystal_info['crystal'], emax=emax_bragg, dcutoff=dcutoff)
         # Convert from numpy array to list of (E, delta) tuples
         bragg = [(bragg_data[i, 0], bragg_data[i, 1]) for i in range(nedge)]
         crystal_info['species_corr'] = species_corr

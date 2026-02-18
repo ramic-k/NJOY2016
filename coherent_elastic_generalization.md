@@ -111,9 +111,8 @@ Note: when all species have the same W, the per-species formula reduces to
 
 ## 2. Per-Species Correlation Matrix
 
-The Bragg-edge calculator (`compute_bragg_edges_general`) optionally returns a
-per-species correlation matrix alongside the standard `bragg_data` array. This
-is activated by `per_species=True`.
+The Bragg-edge calculator (`compute_bragg_edges_general`) always returns a
+per-species correlation matrix alongside the standard `bragg_data` array.
 
 For each Bragg edge `j`, the correlation matrix is:
 

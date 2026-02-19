@@ -12,11 +12,23 @@ framework, using phonopy as the single source of lattice dynamics data.
   for creating thermal neutron scattering libraries with mixed elastic support",
   *Nuclear Instruments and Methods in Physics Research Section A*, **1027** (2022)
   166227.
-- K. H. Fleming, D. E. Holcomb, B. R. Betzler, "Implementation of generalized
-  thermal scattering laws in the FLASSH tool", *Nuclear Science and Engineering*,
-  **197** (2023).
-- Y. Q. Cheng, "An Optimized CaLculation of Inelastic and Magnetic Average
-  X-section (OCLIMAX)", DOE Oak Ridge, 2020.
+- N. C. Fleming, C. A. Manring, B. K. Laramee, J. P. W. Crozier, E. Lee, and
+  A. I. Hawari, "*FLASSH* 1.0: Thermal Scattering Law Evaluation and
+  Cross-Section Generation for Reactor Physics Applications", *Nuclear Science
+  and Engineering*, **197**(8) (2023) 1887-1901.
+  DOI: 10.1080/00295639.2023.2194195
+- Y. Q. Cheng and A. J. Ramirez-Cuesta, "Calculation of the Thermal Neutron
+  Scattering Cross-Section of Solids Using OCLIMAX", *Journal of Chemical
+  Theory and Computation*, **16**(8) (2020) 5212-5217.
+  DOI: 10.1021/acs.jctc.0c00569
+- Y. Q. Cheng, L. L. Daemen, A. I. Kolesnikov, and A. J. Ramirez-Cuesta,
+  "Simulation of Inelastic Neutron Scattering Spectra Using OCLIMAX",
+  *Journal of Chemical Theory and Computation*, **15**(3) (2019) 1974-1982.
+  DOI: 10.1021/acs.jctc.8b01250
+- M. T. Garba, D. L. Roach, and H. Gonzalez-Velez, "Computational modelling
+  and simulation of polycrystalline coherent inelastic neutron scattering",
+  *Simulation Modelling Practice and Theory*, **77** (2017) 338-349.
+  DOI: 10.1016/j.simpat.2017.08.001
 
 ---
 

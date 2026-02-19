@@ -15,7 +15,7 @@ phonon expansion method. Supports:
       * MEF: Mixed Elastic Format (elastic_mode=2, LTHR=3)
       * Per-species Debye-Waller factors from partial phonon spectra
       * Polyatomic unit cells with DC-atom selection (Ramic et al., NIM-A 1027, 2022)
-  - Generalized coherent inelastic (icoh1=1, FLASSH-style)
+  - Generalized coherent inelastic (ncoh_inel=1, FLASSH-style)
       * Per-direction projected DOS → full phonon expansion (all orders)
       * Captures anisotropy in self scattering for non-cubic crystals
       * Distinct one-phonon S_d^1 from eigenvector BZ sampling
@@ -99,13 +99,13 @@ Card 6e — Partial phonon spectra (repeated nspec times)
 
 Card 6b — Elastic mode and atom counts (extended)
 ---------------------------------------------------
-    elastic_mode  nat  nspec  icoh1  /
+    elastic_mode  nat  nspec  ncoh_inel  /
 
-    icoh1         0 = default (no coherent inelastic correction)
+    ncoh_inel         0 = default (no coherent inelastic correction)
                   1 = generalized coherent inelastic (directional phonon
                       expansion + one-phonon distinct + anisotropic DW)
 
-Card 6f — Coherent inelastic parameters (if icoh1=1)
+Card 6f — Coherent inelastic parameters (if ncoh_inel=1)
 ----------------------------------------------------------
     ndir  mesh_nx  mesh_ny  mesh_nz  sigma  nbin  ncpu  /
     'phonopy_disp_yaml_path'  /
@@ -120,7 +120,7 @@ Card 6f — Coherent inelastic parameters (if icoh1=1)
                       FORCE_SETS must be in the same directory
     born_path         Path to BORN file (optional; auto-detected if present)
 
-    When icoh1=1, ALL phonon data is derived from phonopy:
+    When ncoh_inel=1, ALL phonon data is derived from phonopy:
       - Cards 6e (partial spectra) are NOT needed (nspec=0)
       - Cards 11/12 (continuous distribution) are NOT needed
       - DW factors for elastic scattering use phonopy-derived values
@@ -933,7 +933,7 @@ def _gaussian_smooth(data, sigma_bins):
 
 def _derive_spectra_from_phonopy(crystal_info, mesh=None, sigma_thz=0.0,
                                   nbin=300):
-    """Derive all phonon data from phonopy for icoh1=1.
+    """Derive all phonon data from phonopy for ncoh_inel=1.
 
     Computes DOS tensors from phonopy eigenvectors, extracts the trace
     (isotropic DOS) as the partial spectrum for each atom type, and identifies
@@ -1288,7 +1288,7 @@ def compute_generalized_inelastic(alpha, beta, nalpha, nbeta, lat, arat, tev,
                                    ndir=500, mesh=None, seed=42):
     """Generalized coherent inelastic: directional phonon expansion + anisotropic DW.
 
-    Replaces contin() when icoh1=1. For each random powder direction khat:
+    Replaces contin() when ncoh_inel=1. For each random powder direction khat:
       1. Project DOS tensor onto khat → directional DOS
       2. Feed through contin() → full phonon expansion for that direction
       3. Average over all directions → S_self(alpha, beta)
@@ -4305,12 +4305,12 @@ def run_leapr(input_file, output_file):
     crystal_info = None  # will hold parsed crystal/elastic data if iel==10
 
     if iel == 10:
-        # Card 6b: elastic_mode, nat, nspec, icoh1
+        # Card 6b: elastic_mode, nat, nspec, ncoh_inel
         fvals = reader.read_floats(4, defaults=[0, 0, 0, 0])
         elastic_mode = int(fvals[0])   # 1=CEF, 2=MEF
         nat = int(fvals[1])            # number of distinct atom types
         nspec = int(fvals[2])          # number of partial phonon spectra
-        icoh1 = int(fvals[3])          # 0=default, 1=generalized coherent inelastic
+        ncoh_inel = int(fvals[3])          # 0=default, 1=generalized coherent inelastic
 
         if elastic_mode not in (1, 2):
             raise ValueError(f"elastic_mode must be 1 (CEF) or 2 (MEF), got {elastic_mode}")
@@ -4319,7 +4319,7 @@ def run_leapr(input_file, output_file):
 
         print(f"  Generalized elastic: elastic_mode={elastic_mode} "
               f"({'CEF' if elastic_mode == 1 else 'MEF'}), nat={nat}, nspec={nspec}"
-              f", icoh1={icoh1}")
+              f", ncoh_inel={ncoh_inel}")
 
         # Card 6c: lattice parameters
         fvals = reader.read_floats(6)
@@ -4395,7 +4395,7 @@ def run_leapr(input_file, output_file):
             print(f"    Partial spectrum {isp+1}: Z={sp_Z}, A={sp_A}, "
                   f"delta={sp_delta:.6e}, ni={sp_ni}")
 
-        # Card 6f: coherent inelastic parameters (icoh1=1)
+        # Card 6f: coherent inelastic parameters (ncoh_inel=1)
         coh_inel_ndir = 0
         coh_inel_mesh = [30, 30, 30]
         coh_inel_sigma = 0.0
@@ -4403,7 +4403,7 @@ def run_leapr(input_file, output_file):
         coh_inel_ncpu = 0
         coh_inel_phonopy_path = None
         coh_inel_born_path = None
-        if icoh1 == 1:
+        if ncoh_inel == 1:
             fvals = reader.read_floats(7, defaults=[500, 30, 30, 30, 0.0, 300, 0])
             coh_inel_ndir = int(fvals[0])
             coh_inel_mesh = [int(fvals[1]), int(fvals[2]), int(fvals[3])]
@@ -4491,7 +4491,7 @@ def run_leapr(input_file, output_file):
             'principal_atom_idx': principal_atom_idx,
             'dc_atom_idx': dc_atom_idx,
             'total_atoms_in_cell': total_atoms_in_cell,
-            'icoh1': icoh1,
+            'ncoh_inel': ncoh_inel,
             'coh_inel_ndir': coh_inel_ndir,
             'coh_inel_mesh': coh_inel_mesh,
             'coh_inel_sigma': coh_inel_sigma,
@@ -4532,12 +4532,12 @@ def run_leapr(input_file, output_file):
     idone = False
     ssm_principal = None
 
-    # --- Pre-loop phonopy setup for icoh1=1 ---
-    # When icoh1=1, load phonopy and derive all phonon data (DOS, DW, spectra)
+    # --- Pre-loop phonopy setup for ncoh_inel=1 ---
+    # When ncoh_inel=1, load phonopy and derive all phonon data (DOS, DW, spectra)
     # BEFORE the temperature loop. This replaces Cards 6e, 11, and 12.
-    icoh1_active = (iel == 10 and crystal_info is not None
-                    and crystal_info.get('icoh1', 0) == 1)
-    if icoh1_active:
+    ncoh_inel_active = (iel == 10 and crystal_info is not None
+                    and crystal_info.get('ncoh_inel', 0) == 1)
+    if ncoh_inel_active:
         print("\n  Loading phonopy for coherent inelastic...")
         ph = _load_phonopy_for_coh_inel(
             crystal_info['coh_inel_phonopy_path'],
@@ -4576,18 +4576,18 @@ def run_leapr(input_file, output_file):
             print(f"  Temperature {itemp+1}: {abs(temp):.2f} K")
 
             if itemp == 0 or temp >= 0.0:
-                # Skip reading Cards 11/12 ONLY if icoh1 derives them from
+                # Skip reading Cards 11/12 ONLY if ncoh_inel derives them from
                 # phonopy AND the input doesn't contain them (nspec==0).
                 # When nspec>0, Cards 11/12 are in the file and must be read
                 # to keep the parser aligned, even if values are overridden.
-                skip_dos_cards = (icoh1_active and isecs == 0
+                skip_dos_cards = (ncoh_inel_active and isecs == 0
                                   and nspec == 0)
                 if not skip_dos_cards:
                     fvals = reader.read_floats(2)
                     delta1_read = fvals[0]
                     ni = int(fvals[1])
                     p1_read = reader.read_float_array(ni)
-                    if not (icoh1_active and isecs == 0):
+                    if not (ncoh_inel_active and isecs == 0):
                         # Use file values only if NOT overriding with phonopy
                         delta1 = delta1_read
                         p1 = p1_read
@@ -4622,15 +4622,15 @@ def run_leapr(input_file, output_file):
                     cfrac = reader.read_floats(1)[0]
 
             # Determine coherent inelastic mode
-            icoh1_val = 0
+            ncoh_inel_val = 0
             if iel == 10 and crystal_info is not None and isecs == 0:
-                icoh1_val = crystal_info.get('icoh1', 0)
+                ncoh_inel_val = crystal_info.get('ncoh_inel', 0)
 
-            # Update species MSD for this temperature (icoh1=1)
-            if icoh1_val == 1:
+            # Update species MSD for this temperature (ncoh_inel=1)
+            if ncoh_inel_val == 1:
                 _update_species_msd(crystal_info, itemp, tev, awr)
 
-            if icoh1_val == 1:
+            if ncoh_inel_val == 1:
                 # Generalized coherent inelastic: directional phonon expansion
                 # + one-phonon distinct + anisotropic DW
                 ndir_coh = crystal_info.get('coh_inel_ndir', 500)
@@ -4660,7 +4660,7 @@ def run_leapr(input_file, output_file):
                 print(f"    S_d^1: max={sd1_max:.6e}, sum={np.sum(sd1):.6e}, "
                       f"weight(σ_coh/σ_b)={weight_d:.6f}")
             else:
-                # Standard contin (icoh1=0 or no iel=10)
+                # Standard contin (ncoh_inel=0 or no iel=10)
                 f0, tbar, deltab = contin(ssm[:, :, itemp], alpha, beta,
                                           nalpha, nbeta, lat, arat, tev,
                                           p1, np1, delta1, tbeta, nphon,

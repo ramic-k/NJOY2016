@@ -63,7 +63,7 @@ The incoherent approximation has two key limitations:
    the phonon DOS depends on the direction of Q, and an isotropic treatment
    averages over this anisotropy improperly.
 
-### 1.3 Generalized treatment (icoh1=1)
+### 1.3 Generalized treatment (ncoh_inel=1)
 
 The generalized inelastic treatment addresses both limitations:
 
@@ -185,7 +185,7 @@ For tetragonal TiO2 (I4_1/amd):
 
 ### 4.1 Algorithm
 
-`compute_generalized_inelastic()` replaces `contin()` when icoh1=1:
+`compute_generalized_inelastic()` replaces `contin()` when ncoh_inel=1:
 
 ```
 For ndir random directions khat (Fibonacci sphere):
@@ -302,7 +302,7 @@ where sigma_b = spr * ((1 + awr) / awr)^2 is the bound cross section.
 
 ### 6.1 Single source of truth
 
-When icoh1=1, ALL phonon data is derived from phonopy:
+When ncoh_inel=1, ALL phonon data is derived from phonopy:
 
 | Data | Source | Replaces |
 |------|--------|----------|
@@ -340,19 +340,19 @@ kernel (3-sigma cutoff).
 
 ---
 
-## 7. Input Cards for Coherent Inelastic (icoh1=1)
+## 7. Input Cards for Coherent Inelastic (ncoh_inel=1)
 
-When `icoh1=1` on Card 6b, additional Card 6f is read:
+When `ncoh_inel=1` on Card 6b, additional Card 6f is read:
 
 ### Card 6b — Extended
 
 ```
-elastic_mode  nat  nspec  icoh1  /
+elastic_mode  nat  nspec  ncoh_inel  /
 ```
 
 | Parameter | Values |
 |---|---|
-| `icoh1` | 0 = standard incoherent approximation (default) |
+| `ncoh_inel` | 0 = standard incoherent approximation (default) |
 |         | 1 = generalized coherent inelastic |
 
 ### Card 6f — Coherent inelastic parameters
@@ -375,7 +375,7 @@ ndir  mesh_nx  mesh_ny  mesh_nz  sigma  nbin  ncpu  /
 
 ### Simplified input
 
-When icoh1=1, the input is significantly simplified:
+When ncoh_inel=1, the input is significantly simplified:
 
 - **Card 6e** (partial spectra): NOT needed, set nspec=0
 - **Cards 11/12** (continuous DOS): NOT needed, derived from phonopy
@@ -385,12 +385,12 @@ Example MgO input:
 ```
 leapr
 20
-'tsl Mg in MgO - icoh1=1'/
+'tsl Mg in MgO - ncoh_inel=1'/
 1 0 100/
 58 12024 0/
 23.785 3.631 1 10 0 0/
 0 0 0 0 0/
-1 2 0 1/                              ! elastic_mode=1, nat=2, nspec=0, icoh1=1
+1 2 0 1/                              ! elastic_mode=1, nat=2, nspec=0, ncoh_inel=1
 4.2556 4.2556 4.2556 90.0 90.0 90.0/
 12 24 23.785 5.375 0.08 4/
 0.0 0.0 0.0  0.0 0.5 0.5  0.5 0.0 0.5  0.5 0.5 0.0/
@@ -410,7 +410,7 @@ stop
 
 ### Backward compatibility
 
-When icoh1=1 is used with the old input format (nspec>0 with Cards 6e and
+When ncoh_inel=1 is used with the old input format (nspec>0 with Cards 6e and
 11/12 present), the code reads and discards the file-provided spectra, using
 phonopy-derived values instead. This keeps the parser aligned.
 
@@ -420,7 +420,7 @@ phonopy-derived values instead. This keeps the parser aligned.
 
 ### 8.1 Pre-loop setup (before temperature loop)
 
-When icoh1=1:
+When ncoh_inel=1:
 1. Load phonopy from Card 6f path
 2. Match phonopy atoms to Card 6d atom types
 3. `_derive_spectra_from_phonopy()`: compute DOS tensors, extract spectra,

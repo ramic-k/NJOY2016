@@ -109,18 +109,67 @@ Card 6b — Elastic mode and atom counts (extended)
 
 Card 6f — Coherent inelastic parameters (if ncoh_inel=1)
 ----------------------------------------------------------
-    ndir  mesh_nx  mesh_ny  mesh_nz  sigma  nbin  ncpu  /
-    'phonopy_disp_yaml_path'  /
+    ndir  mesh_nx  mesh_ny  mesh_nz  nbin  ncpu  sd1_sigma  /
+    'phonopy_path'  /
     'born_path'  /                         (optional)
 
-    ndir              Number of powder-averaging directions (default 500)
-    mesh_nx/ny/nz     BZ mesh points per axis for DOS tensor (default 30 30 30)
-    sigma             Gaussian smearing width in THz (default 0)
-    nbin              Number of DOS energy grid points (default 300)
-    ncpu              Number of CPUs for parallel directions (0 = all available)
-    phonopy_path      Path to phonopy_disp.yaml (quoted string)
-                      FORCE_SETS must be in the same directory
-    born_path         Path to BORN file (optional; auto-detected if present)
+    ndir              Number of powder-averaging directions (default 500).
+                      Controls the number of golden-spiral sphere points used
+                      for both the directional self-scattering powder average
+                      and the per-alpha BZ sphere sampling for the distinct
+                      one-phonon contribution.
+    mesh_nx/ny/nz     BZ mesh points per axis for DOS tensor (default 30 30 30).
+                      These define the Monkhorst-Pack grid used to compute the
+                      3x3 phonon DOS tensor for each species.
+    nbin              Number of energy bins for the DOS tensor (default 300).
+    ncpu              Number of CPUs for parallel directions (0 = all available).
+    sd1_sigma         Gaussian smoothing width (in meV) applied to the distinct
+                      one-phonon contribution S_d^1(alpha, beta) along the beta
+                      axis BEFORE it is added to the total S(alpha, beta).
+                      (default 0 = no smoothing)
+
+                      The distinct one-phonon channel is computed by sampling
+                      phonon modes at discrete Q-points on a sphere for each
+                      alpha value. With a finite number of sphere sampling
+                      points (ndir), statistical sampling noise produces
+                      jaggedness in S_d^1 as a function of beta (energy
+                      transfer). This noise is most pronounced at high Q
+                      (large alpha) where fewer phonon modes contribute per
+                      sphere point.
+
+                      Setting sd1_sigma to a small positive value (typically
+                      1-3 meV) applies a Gaussian filter of that width along
+                      the beta axis of S_d^1, suppressing the sampling noise
+                      without significantly broadening the physical phonon
+                      features. The smoothing is applied independently at each
+                      alpha value. The total integrated area of S_d^1 is
+                      preserved by the Gaussian filter (it redistributes
+                      weight locally but does not add or remove it).
+
+                      Recommended values:
+                        0     No smoothing (raw sphere-sampled result)
+                        1.0   Light smoothing; removes high-frequency noise
+                        2.0   Moderate smoothing; good balance of noise
+                              suppression and feature preservation
+                        4.0   Heavy smoothing; may wash out fine structure
+
+                      Increasing ndir is an alternative way to reduce noise
+                      (more sphere points → better statistics), but at
+                      higher computational cost. Smoothing via sd1_sigma
+                      is a cheaper post-processing approach.
+
+    phonopy_path      Path to phonopy.yaml with embedded force constants, or
+                      phonopy_disp.yaml with FORCE_SETS in the same directory
+                      (quoted string). To generate phonopy.yaml with embedded
+                      force constants from phonopy, use:
+                        ph = phonopy.load('phonopy_disp.yaml',
+                                          force_sets_filename='FORCE_SETS')
+                        ph.produce_force_constants()
+                        ph.save('phonopy.yaml',
+                                settings={'force_constants': True})
+    born_path         Path to BORN file for non-analytic corrections at the
+                      zone center (optional; auto-detected if present in the
+                      same directory as phonopy_path).
 
     When ncoh_inel=1, ALL phonon data is derived from phonopy via Euphonic:
       - Cards 6e (partial spectra) are NOT needed (nspec=0)
@@ -796,6 +845,57 @@ def _batch_splat(beta_grid, beta_vals, weights, output, nbeta):
         output[hi] += w * frac
 
 
+def _vectorized_splat(beta_grid, beta_vals_flat, weights_flat, nbeta):
+    """Vectorized splat of (beta, weight) pairs onto beta grid.
+
+    Uses np.searchsorted for bin lookup and np.add.at for scatter-add.
+    Much faster than the Python-loop _batch_splat for large arrays.
+
+    Parameters
+    ----------
+    beta_grid : ndarray, shape (nbeta,)
+    beta_vals_flat : ndarray, shape (N,) — beta values to bin
+    weights_flat : ndarray, shape (N,) — corresponding weights
+    nbeta : int
+
+    Returns
+    -------
+    output : ndarray, shape (nbeta,)
+    """
+    output = np.zeros(nbeta)
+    if len(beta_vals_flat) == 0:
+        return output
+
+    # Find bin index: searchsorted gives index where value would be inserted;
+    # subtract 1 to get the lower bin edge index.
+    idx = np.searchsorted(beta_grid[:nbeta], beta_vals_flat, side='right') - 1
+
+    # Mask valid bins: idx in [0, nbeta-2] (need idx and idx+1 both valid)
+    valid = (idx >= 0) & (idx < nbeta - 1)
+    idx_v = idx[valid]
+    bv = beta_vals_flat[valid]
+    wv = weights_flat[valid]
+
+    if len(idx_v) == 0:
+        return output
+
+    # Linear interpolation fraction
+    db = beta_grid[idx_v + 1] - beta_grid[idx_v]
+    good = db > 0
+    idx_v = idx_v[good]
+    bv = bv[good]
+    wv = wv[good]
+    db = db[good]
+
+    frac = (bv - beta_grid[idx_v]) / db
+
+    # Scatter-add with linear interpolation weights
+    np.add.at(output, idx_v, wv * (1.0 - frac))
+    np.add.at(output, idx_v + 1, wv * frac)
+
+    return output
+
+
 def _derive_spectra_from_euphonic(crystal_info, fc, atom_map, mesh=None,
                                    sigma_thz=0.0, nbin=300):
     """Derive all phonon data from Euphonic for ncoh_inel=1.
@@ -913,7 +1013,8 @@ def compute_onephonon_eigvec_euphonic(fc, atom_map, crystal_info,
                                        dw_obj, ndir=500,
                                        f0_input=None, delta1=None,
                                        np1=None, tbeta=1.0,
-                                       rho_precomputed=None):
+                                       rho_precomputed=None,
+                                       sd1_sigma=0.0):
     """Compute eigenvector-based one-phonon scattering (self + distinct)
     using Euphonic's batched sphere sampling.
 
@@ -951,6 +1052,11 @@ def compute_onephonon_eigvec_euphonic(fc, atom_map, crystal_info,
         Normalization parameter.
     rho_precomputed : ndarray or None
         Isotropic DOS for principal scatterer (if pre-computed).
+    sd1_sigma : float
+        Gaussian smoothing width in meV applied to the distinct one-phonon
+        S_d^1 along the beta axis. Suppresses statistical sampling noise
+        from finite sphere points without broadening physical features.
+        Set to 0 (default) for no smoothing.
 
     Returns
     -------
@@ -959,6 +1065,7 @@ def compute_onephonon_eigvec_euphonic(fc, atom_map, crystal_info,
     sd1 : ndarray, shape (nbeta, nalpha)
         Distinct one-phonon (coherent cross-term),
         NOT yet weighted by sigma_coh/sigma_b.
+        If sd1_sigma > 0, Gaussian smoothing has been applied along beta.
     """
     from euphonic.sampling import golden_sphere
 
@@ -1029,8 +1136,14 @@ def compute_onephonon_eigvec_euphonic(fc, atom_map, crystal_info,
     # Pre-compute 1/sqrt(mass) for all atoms
     inv_sqrt_m = 1.0 / np.sqrt(masses_amu)  # (natom,)
 
+    # b/sqrt(m) prefactor per atom: (natom,) in sqrt(barn)/sqrt(amu)
+    b_over_sqrtm = b_coh * inv_sqrt_m
+
     # Generate sphere directions (unit vectors)
     sphere_pts = np.array(list(golden_sphere(ndir)))  # (ndir, 3)
+
+    # Pre-compute inverse reciprocal lattice (only once, not per alpha)
+    inv_recip = np.linalg.inv(recip)  # (3, 3)
 
     raw_self_grid = np.zeros((nbeta, nalpha))
     raw_distinct_grid = np.zeros((nbeta, nalpha))
@@ -1046,8 +1159,6 @@ def compute_onephonon_eigvec_euphonic(fc, atom_map, crystal_info,
         Q_cart = sphere_pts * Qmag
 
         # Convert Q_cart to fractional q-points
-        # Q_cart = q_frac @ recip, so q_frac = Q_cart @ inv(recip)
-        inv_recip = np.linalg.inv(recip)
         q_frac = Q_cart @ inv_recip  # (ndir, 3)
 
         # Batch compute phonon modes at all sphere Q-points
@@ -1055,66 +1166,65 @@ def compute_onephonon_eigvec_euphonic(fc, atom_map, crystal_info,
         freqs_ev = modes.frequencies.to('eV').magnitude  # (ndir, nmodes)
         eigvecs = modes.eigenvectors  # (ndir, nmodes, natom, 3)
 
-        raw_self_alpha = np.zeros(nbeta)
-        raw_distinct_alpha = np.zeros(nbeta)
+        # ============================================================
+        # Fully vectorized structure factor computation over all
+        # sphere points and modes simultaneously.
+        # ============================================================
 
-        # Process all sphere points
-        for iq in range(ndir):
-            Qvec = Q_cart[iq]  # (3,) in 1/Angstrom
+        # Betas for all modes: (ndir, nmodes)
+        betas_all = freqs_ev / tev
 
-            # Filter valid modes
-            valid_mask = freqs_ev[iq] > 1e-10
-            if not np.any(valid_mask):
-                continue
-            valid_idx = np.where(valid_mask)[0]
-            omegas_v = freqs_ev[iq, valid_idx]  # (nv,) in eV
-            betas_v = omegas_v / tev  # dimensionless
-            range_mask = (betas_v > 1e-10) & (betas_v < 500)
-            if not np.any(range_mask):
-                continue
+        # Valid mode mask: positive frequency, beta in usable range
+        valid = (freqs_ev > 1e-10) & (betas_all > 1e-10) & (betas_all < 500)
 
-            mode_idx = valid_idx[range_mask]
-            betas_v = betas_v[range_mask]
-            omegas_v = omegas_v[range_mask]
-            bose_v = 1.0 / (np.exp(betas_v) - 1.0)
-            nv = len(mode_idx)
+        # DW factors per atom per sphere point: exp(-Q W Q)
+        # W_tensor: (natom, 3, 3), Q_cart: (ndir, 3)
+        # -> (ndir, natom)
+        dw_all = np.exp(-np.einsum('qa,kab,qb->qk', Q_cart, W_tensor, Q_cart))
 
-            # Eigenvectors for valid modes: (nv, natom, 3)
-            evecs_v = eigvecs[iq, mode_idx]
+        # Phase factors: exp(2*pi*i * q_frac . r_frac)
+        # q_frac: (ndir, 3), atom_r: (natom, 3) -> (ndir, natom)
+        phases_all = np.exp(2j * pi * (q_frac @ atom_r.T))
 
-            # Q dot e* for all atoms and modes: (nv, natom)
-            Qe = np.einsum('vkl,l->vk', np.conj(evecs_v), Qvec)
+        # Combined per-atom prefactor: b/sqrt(m) * DW * phase
+        # (ndir, natom) complex
+        prefactor_all = b_over_sqrtm[np.newaxis, :] * dw_all * phases_all
 
-            # DW factors per atom: (natom,)
-            dw_atoms = np.exp(-np.einsum('a,kab,b->k',
-                                          Qvec, W_tensor, Qvec))
+        # Q dot e* for all sphere points, modes, atoms:
+        # eigvecs: (ndir, nmodes, natom, 3), Q_cart: (ndir, 3)
+        # -> conj(eigvecs) contracted with Q over cartesian index
+        # result: (ndir, nmodes, natom) complex
+        Qe_all = np.einsum('qvkl,ql->qvk', np.conj(eigvecs), Q_cart)
 
-            # Phase factors: exp(2*pi*i * q_frac . r_frac): (natom,)
-            phases = np.exp(2j * pi * np.dot(atom_r, q_frac[iq]))
+        # Full amplitude A_kappa(q,nu) = Qe * prefactor: (ndir, nmodes, natom)
+        A_all = Qe_all * prefactor_all[:, np.newaxis, :]
 
-            # Per-atom amplitude prefactor: b/sqrt(m) * dw * phase: (natom,)
-            prefactor = b_coh * inv_sqrt_m * dw_atoms * phases
+        # Structure factors per mode: (ndir, nmodes)
+        A_sum_all = np.sum(A_all, axis=2)   # sum over atoms
+        F_total_all = np.abs(A_sum_all)**2
+        A_self_sq_all = np.sum(np.abs(A_all)**2, axis=2)
+        F_distinct_all = F_total_all - A_self_sq_all
 
-            # Full amplitude: A_kappa(nu) = prefactor * (Q.e*): (nv, natom)
-            A = Qe * prefactor[np.newaxis, :]
+        # Bose factor and kinematic weight for valid modes
+        # Use safe values where invalid to avoid overflow, then zero out
+        safe_betas = np.where(valid, betas_all, 1.0)
+        safe_freqs = np.where(valid, freqs_ev, 1.0)
+        bose_all = 1.0 / (np.exp(safe_betas) - 1.0)
+        kinematic_all = (bose_all + 1.0) / (2.0 * natom_ph * safe_freqs)
 
-            # Structure factors per mode
-            A_sum = np.sum(A, axis=1)  # (nv,) sum over atoms
-            F_total = np.abs(A_sum)**2  # (nv,)
-            A_self_sq = np.sum(np.abs(A)**2, axis=1)  # (nv,)
-            F_distinct = F_total - A_self_sq  # (nv,)
+        # Weighted contributions (zero where invalid)
+        self_w = np.where(valid, A_self_sq_all * kinematic_all, 0.0)
+        distinct_w = np.where(valid, F_distinct_all * kinematic_all, 0.0)
 
-            # Kinematic weights: (bose+1)/(2*N*omega) for creation side
-            kinematic = (bose_v + 1.0) / (2.0 * natom_ph * omegas_v)
+        # Flatten valid contributions and bin onto beta grid
+        flat_betas = betas_all[valid]
+        flat_self = self_w[valid]
+        flat_distinct = distinct_w[valid]
 
-            # Batch splat to beta grid
-            _batch_splat(betan, betas_v, A_self_sq * kinematic,
-                         raw_self_alpha, nbeta)
-            _batch_splat(betan, betas_v, F_distinct * kinematic,
-                         raw_distinct_alpha, nbeta)
-
-        raw_self_grid[:, ia] = raw_self_alpha / ndir
-        raw_distinct_grid[:, ia] = raw_distinct_alpha / ndir
+        raw_self_grid[:, ia] = _vectorized_splat(
+            betan, flat_betas, flat_self, nbeta) / ndir
+        raw_distinct_grid[:, ia] = _vectorized_splat(
+            betan, flat_betas, flat_distinct, nbeta) / ndir
 
     # Cross-normalize distinct using self-consistency with DOS-based self S1
     sum_ss1 = np.sum(ss1)
@@ -1128,6 +1238,34 @@ def compute_onephonon_eigvec_euphonic(fc, atom_map, crystal_info,
     print(f"      Distinct norm: C={C_norm:.6e}, "
           f"sum_ss1={sum_ss1:.6e}, sum_raw_self={sum_raw_self:.6e}")
 
+    # Apply Gaussian smoothing to sd1 along beta axis if requested.
+    # The smoothing width sd1_sigma is in meV; convert to beta units using
+    # kT and the LAT scaling, then to grid-spacing units for the filter.
+    if sd1_sigma > 0.0 and nalpha > 0 and nbeta > 1:
+        BK = 8.617333262e-5
+        THERM = 0.0253
+        kT_meV = tev * 1000.0
+        # beta spacing (may be non-uniform; use median for Gaussian width)
+        dbeta = np.diff(beta)
+        median_dbeta = np.median(dbeta)
+        # Convert sd1_sigma from meV to beta units: dE = dbeta * kT
+        # so sigma_beta = sigma_meV / kT_meV
+        # With LAT=1 scaling: beta_physical = beta * (THERM/kT)
+        # so dE = dbeta * THERM*1000 (in meV)
+        if lat == 1:
+            sigma_beta = sd1_sigma / (THERM * 1000.0)
+        else:
+            sigma_beta = sd1_sigma / kT_meV
+        sigma_bins = sigma_beta / median_dbeta
+        if sigma_bins >= 0.5:
+            sd1_sum_before = np.sum(sd1)
+            for ia in range(nalpha):
+                sd1[:, ia] = _gaussian_smooth(sd1[:, ia], sigma_bins)
+            sd1_sum_after = np.sum(sd1)
+            print(f"      Distinct smoothing: sd1_sigma={sd1_sigma:.2f} meV, "
+                  f"sigma_bins={sigma_bins:.1f}, "
+                  f"sum ratio={sd1_sum_after / sd1_sum_before:.6f}")
+
     return ss1, sd1
 
 
@@ -1135,7 +1273,7 @@ def compute_generalized_inelastic(alpha, beta, nalpha, nbeta, lat, arat, tev,
                                    temp, awr, spr, crystal_info, itemp,
                                    p1_input, np1, delta1, tbeta, nphon,
                                    fc, atom_map, dw_obj,
-                                   ndir=500, mesh=None):
+                                   ndir=500, mesh=None, sd1_sigma=0.0):
     """Generalized coherent inelastic: directional phonon expansion + Euphonic.
 
     Replaces contin() when ncoh_inel=1. For each random powder direction khat:
@@ -1143,6 +1281,13 @@ def compute_generalized_inelastic(alpha, beta, nalpha, nbeta, lat, arat, tev,
       2. Feed through contin() -> full phonon expansion for that direction
       3. Average over all directions -> S_self(alpha, beta)
     Then add distinct one-phonon from Euphonic sphere sampling.
+
+    Parameters
+    ----------
+    sd1_sigma : float
+        Gaussian smoothing width in meV for the distinct one-phonon channel.
+        Applied along the beta axis of S_d^1 to suppress statistical sampling
+        noise from finite sphere points. Default 0 = no smoothing.
 
     Returns: (ssm_self, sd1, f0, tbar, deltab)
       ssm_self: directional self S(alpha,beta) [nbeta, nalpha]
@@ -1230,7 +1375,8 @@ def compute_generalized_inelastic(alpha, beta, nalpha, nbeta, lat, arat, tev,
         tev, awr, itemp, dw_obj,
         ndir=ndir,
         f0_input=f0_iso, delta1=delta1, np1=np1, tbeta=tbeta,
-        rho_precomputed=rho_trace)
+        rho_precomputed=rho_trace,
+        sd1_sigma=sd1_sigma)
 
     return ssm_self, sd1, f0_iso, tbar_iso, deltab_iso
 
@@ -4296,18 +4442,19 @@ def run_leapr(input_file, output_file):
         # Card 6f: coherent inelastic parameters (ncoh_inel=1)
         coh_inel_ndir = 0
         coh_inel_mesh = [30, 30, 30]
-        coh_inel_sigma = 0.0
         coh_inel_nbin = 300
         coh_inel_ncpu = 0
         coh_inel_phonopy_path = None
         coh_inel_born_path = None
+        coh_inel_sd1_sigma = 0.0
         if ncoh_inel == 1:
-            fvals = reader.read_floats(7, defaults=[500, 30, 30, 30, 0.0, 300, 0])
+            fvals = reader.read_floats(
+                7, defaults=[500, 30, 30, 30, 300, 0, 0.0])
             coh_inel_ndir = int(fvals[0])
             coh_inel_mesh = [int(fvals[1]), int(fvals[2]), int(fvals[3])]
-            coh_inel_sigma = fvals[4]
-            coh_inel_nbin = int(fvals[5])
-            coh_inel_ncpu = int(fvals[6])
+            coh_inel_nbin = int(fvals[4])
+            coh_inel_ncpu = int(fvals[5])
+            coh_inel_sd1_sigma = fvals[6]  # Gaussian smoothing of S_d^1 (meV)
 
             # Read phonopy path (quoted string — strip quotes)
             coh_inel_phonopy_path = reader.read_string().strip("'\"")
@@ -4321,8 +4468,11 @@ def run_leapr(input_file, output_file):
                     coh_inel_born_path = born_str
 
             print(f"  Coherent inelastic: ndir={coh_inel_ndir}, "
-                  f"mesh={coh_inel_mesh}, sigma={coh_inel_sigma:.2f} THz, "
+                  f"mesh={coh_inel_mesh}, "
                   f"nbin={coh_inel_nbin}, ncpu={coh_inel_ncpu}")
+            if coh_inel_sd1_sigma > 0:
+                print(f"    sd1_sigma={coh_inel_sd1_sigma:.2f} meV "
+                      f"(Gaussian smoothing of distinct one-phonon)")
             print(f"    phonopy_path: {coh_inel_phonopy_path}")
             if coh_inel_born_path:
                 print(f"    born_path: {coh_inel_born_path}")
@@ -4341,11 +4491,11 @@ def run_leapr(input_file, output_file):
             'ncoh_inel': ncoh_inel,
             'coh_inel_ndir': coh_inel_ndir,
             'coh_inel_mesh': coh_inel_mesh,
-            'coh_inel_sigma': coh_inel_sigma,
             'coh_inel_nbin': coh_inel_nbin,
             'coh_inel_ncpu': coh_inel_ncpu,
             'coh_inel_phonopy_path': coh_inel_phonopy_path,
             'coh_inel_born_path': coh_inel_born_path,
+            'coh_inel_sd1_sigma': coh_inel_sd1_sigma,
         }
 
     # Card 7: alpha, beta control
@@ -4398,13 +4548,12 @@ def run_leapr(input_file, output_file):
 
         # Derive all phonon spectra from Euphonic
         coh_mesh = crystal_info.get('coh_inel_mesh', [30, 30, 30])
-        coh_sigma = crystal_info.get('coh_inel_sigma', 0.0)
         coh_nbin = crystal_info.get('coh_inel_nbin', 300)
         print(f"    Deriving phonon spectra from Euphonic "
-              f"(mesh={coh_mesh}, sigma={coh_sigma:.2f} THz, nbin={coh_nbin})...")
+              f"(mesh={coh_mesh}, nbin={coh_nbin})...")
         _derive_spectra_from_euphonic(
             crystal_info, _euphonic_fc, _euphonic_atom_map,
-            mesh=coh_mesh, sigma_thz=coh_sigma, nbin=coh_nbin)
+            mesh=coh_mesh, sigma_thz=0.0, nbin=coh_nbin)
 
         # Override delta1, np1, p1 with Euphonic-derived values
         # (will be used on first entry into temperature loop)
@@ -4499,12 +4648,14 @@ def run_leapr(input_file, output_file):
                 dwpix_euphonic = _euphonic_dw_to_leapr_dwpix(
                     W_principal, awr, tev)
 
+                sd1_sigma_coh = crystal_info.get('coh_inel_sd1_sigma', 0.0)
                 ssm_self, sd1, f0, tbar, deltab = compute_generalized_inelastic(
                     alpha, beta, nalpha, nbeta, lat, arat, tev,
                     abs(temp), awr, spr, crystal_info, itemp,
                     p1, np1, delta1, tbeta, nphon,
                     _euphonic_fc, _euphonic_atom_map, dw_obj,
-                    ndir=ndir_coh, mesh=mesh_coh)
+                    ndir=ndir_coh, mesh=mesh_coh,
+                    sd1_sigma=sd1_sigma_coh)
 
                 # Replace ssm with directional self S(alpha,beta)
                 ssm[:, :, itemp] = ssm_self

@@ -1331,8 +1331,6 @@ def compute_onephonon_eigvec_euphonic(fc, atom_map, crystal_info,
     # The smoothing width sd1_sigma is in meV; convert to beta units
     # using kT and the LAT scaling, then to grid-spacing units.
     if sd1_sigma > 0.0 and nalpha > 0 and nbeta > 1:
-        BK = 8.617333262e-5
-        THERM = 0.0253
         kT_meV = tev * 1000.0
         # beta spacing (may be non-uniform; use median for Gaussian width)
         dbeta = np.diff(beta)

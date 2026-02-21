@@ -1139,6 +1139,13 @@ def compute_onephonon_eigvec_euphonic(fc, atom_map, crystal_info,
     # b/sqrt(m) prefactor per atom: (natom,) in sqrt(barn)/sqrt(amu)
     b_over_sqrtm = b_coh * inv_sqrt_m
 
+    # Boolean mask: True for atoms belonging to principal species.
+    # Used to decompose the structure factor into principal-only self
+    # and principal-involving distinct (excluding non-principal cross-terms).
+    principal_mask = np.array([atom_map[d] == principal_idx
+                               for d in range(natom_ph)])  # (natom,)
+    n_principal = np.sum(principal_mask)
+
     # Generate sphere directions (unit vectors)
     sphere_pts = np.array(list(golden_sphere(ndir)))  # (ndir, 3)
 
@@ -1199,11 +1206,47 @@ def compute_onephonon_eigvec_euphonic(fc, atom_map, crystal_info,
         # Full amplitude A_kappa(q,nu) = Qe * prefactor: (ndir, nmodes, natom)
         A_all = Qe_all * prefactor_all[:, np.newaxis, :]
 
-        # Structure factors per mode: (ndir, nmodes)
-        A_sum_all = np.sum(A_all, axis=2)   # sum over atoms
-        F_total_all = np.abs(A_sum_all)**2
-        A_self_sq_all = np.sum(np.abs(A_all)**2, axis=2)
-        F_distinct_all = F_total_all - A_self_sq_all
+        # --------------------------------------------------------
+        # Species-aware structure factor decomposition.
+        #
+        # For a principal species P, the one-phonon scattering
+        # involves atoms of P being struck and coherently
+        # interfering with ALL atoms in the unit cell:
+        #
+        #   S_P = Σ_{d∈P} A_d     (principal amplitude)
+        #   S_all = Σ_all A_κ      (total amplitude)
+        #
+        #   F_self_P = Σ_{d∈P} |A_d|²
+        #   F_total_P = Re(S_P* × S_all)
+        #   F_distinct_P = F_total_P - F_self_P
+        #
+        # This includes P-P and P-other cross-terms but
+        # excludes other-other cross-terms that don't involve
+        # the principal scatterer.
+        #
+        # For single-species materials (e.g. graphite), this
+        # reduces to the standard |S_all|² - Σ|A|² formula.
+        # --------------------------------------------------------
+
+        # Amplitude sum over ALL atoms: (ndir, nmodes)
+        S_all = np.sum(A_all, axis=2)
+
+        # Amplitude sum over PRINCIPAL atoms only: (ndir, nmodes)
+        S_principal = np.sum(A_all[:, :, principal_mask], axis=2)
+
+        # Self for principal atoms only: Σ_{d∈P} |A_d|²
+        F_self_P = np.sum(
+            np.abs(A_all[:, :, principal_mask])**2, axis=2)
+
+        # Total one-phonon involving principal: Re(S_P* × S_all)
+        # Includes P-P cross-terms + P-other interference.
+        # The real part is taken because individual (q,ν) terms
+        # may be complex, but imaginary parts cancel upon powder
+        # averaging over the sphere.
+        F_total_P = np.real(np.conj(S_principal) * S_all)
+
+        # Distinct = total involving principal - self of principal
+        F_distinct_P = F_total_P - F_self_P
 
         # Bose factor and kinematic weight for valid modes
         # Use safe values where invalid to avoid overflow, then zero out
@@ -1213,8 +1256,8 @@ def compute_onephonon_eigvec_euphonic(fc, atom_map, crystal_info,
         kinematic_all = (bose_all + 1.0) / (2.0 * natom_ph * safe_freqs)
 
         # Weighted contributions (zero where invalid)
-        self_w = np.where(valid, A_self_sq_all * kinematic_all, 0.0)
-        distinct_w = np.where(valid, F_distinct_all * kinematic_all, 0.0)
+        self_w = np.where(valid, F_self_P * kinematic_all, 0.0)
+        distinct_w = np.where(valid, F_distinct_P * kinematic_all, 0.0)
 
         # Flatten valid contributions and bin onto beta grid
         flat_betas = betas_all[valid]

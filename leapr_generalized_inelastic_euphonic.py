@@ -158,6 +158,7 @@ Card 6f — Coherent inelastic parameters (if ncoh_inel=1)
                       higher computational cost. Smoothing via sd1_sigma
                       is a cheaper post-processing approach.
 
+
     phonopy_path      Path to phonopy.yaml with embedded force constants, or
                       phonopy_disp.yaml with FORCE_SETS in the same directory
                       (quoted string). To generate phonopy.yaml with embedded
@@ -1146,6 +1147,25 @@ def compute_onephonon_eigvec_euphonic(fc, atom_map, crystal_info,
                                for d in range(natom_ph)])  # (natom,)
     n_principal = np.sum(principal_mask)
 
+    # Determine whether inter-species cross terms should be included
+    # in this species' distinct one-phonon.  To avoid double-counting
+    # when the transport code sums TSLs from all species, the inter-
+    # species cross term Re(S_P* × S_other) is attributed ONLY to the
+    # species with the highest coherent cross section (analogous to
+    # the CEF treatment).  For single-species materials this is moot.
+    n_species = crystal_info.get('nat', 1)
+    include_interspecies = True  # default: include (single-species or highest σ_coh)
+    if n_species > 1:
+        sigma_coh_principal = atom_types[principal_idx]['sigma_coh']
+        max_sigma_coh = max(at['sigma_coh'] for at in atom_types)
+        if sigma_coh_principal < max_sigma_coh:
+            include_interspecies = False
+            print(f"      Inter-species cross terms: EXCLUDED "
+                  f"(σ_coh={sigma_coh_principal:.4f} < max={max_sigma_coh:.4f})")
+        else:
+            print(f"      Inter-species cross terms: INCLUDED "
+                  f"(σ_coh={sigma_coh_principal:.4f} = max)")
+
     # Generate sphere directions (unit vectors)
     sphere_pts = np.array(list(golden_sphere(ndir)))  # (ndir, 3)
 
@@ -1217,19 +1237,22 @@ def compute_onephonon_eigvec_euphonic(fc, atom_map, crystal_info,
         #   S_all = Σ_all A_κ      (total amplitude)
         #
         #   F_self_P = Σ_{d∈P} |A_d|²
-        #   F_total_P = Re(S_P* × S_all)
+        #   F_self_P = Σ_{d∈P} |A_d|²
+        #
+        # If include_interspecies (P has highest σ_coh or single species):
+        #   F_total_P = Re(S_P* × S_all)      [P-P + P-other cross-terms]
+        # Else (P does NOT have highest σ_coh):
+        #   F_total_P = |S_P|²                 [P-P cross-terms only]
+        #
         #   F_distinct_P = F_total_P - F_self_P
         #
-        # This includes P-P and P-other cross-terms but
-        # excludes other-other cross-terms that don't involve
-        # the principal scatterer.
+        # The inter-species cross term Re(S_P* × S_other) is
+        # attributed only to the species with the highest σ_coh
+        # to avoid double-counting when TSLs are summed.
         #
         # For single-species materials (e.g. graphite), this
         # reduces to the standard |S_all|² - Σ|A|² formula.
         # --------------------------------------------------------
-
-        # Amplitude sum over ALL atoms: (ndir, nmodes)
-        S_all = np.sum(A_all, axis=2)
 
         # Amplitude sum over PRINCIPAL atoms only: (ndir, nmodes)
         S_principal = np.sum(A_all[:, :, principal_mask], axis=2)
@@ -1238,12 +1261,19 @@ def compute_onephonon_eigvec_euphonic(fc, atom_map, crystal_info,
         F_self_P = np.sum(
             np.abs(A_all[:, :, principal_mask])**2, axis=2)
 
-        # Total one-phonon involving principal: Re(S_P* × S_all)
-        # Includes P-P cross-terms + P-other interference.
-        # The real part is taken because individual (q,ν) terms
-        # may be complex, but imaginary parts cancel upon powder
-        # averaging over the sphere.
-        F_total_P = np.real(np.conj(S_principal) * S_all)
+        if include_interspecies:
+            # Total one-phonon involving principal: Re(S_P* × S_all)
+            # Includes P-P cross-terms + P-other interference.
+            # The real part is taken because individual (q,ν) terms
+            # may be complex, but imaginary parts cancel upon powder
+            # averaging over the sphere.
+            S_all = np.sum(A_all, axis=2)
+            F_total_P = np.real(np.conj(S_principal) * S_all)
+        else:
+            # Intra-species only: |S_P|² (no inter-species cross terms)
+            # Inter-species cross terms are attributed to the species
+            # with the highest σ_coh to avoid double-counting.
+            F_total_P = np.real(np.conj(S_principal) * S_principal)
 
         # Distinct = total involving principal - self of principal
         F_distinct_P = F_total_P - F_self_P
@@ -1269,21 +1299,37 @@ def compute_onephonon_eigvec_euphonic(fc, atom_map, crystal_info,
         raw_distinct_grid[:, ia] = _vectorized_splat(
             betan, flat_betas, flat_distinct, nbeta) / ndir
 
-    # Cross-normalize distinct using self-consistency with DOS-based self S1
-    sum_ss1 = np.sum(ss1)
-    sum_raw_self = np.sum(raw_self_grid)
-    if sum_raw_self > 1e-30:
-        C_norm = sum_ss1 / sum_raw_self
+    # ================================================================
+    # Per-alpha cross-normalization of distinct one-phonon.
+    # Using per-alpha normalization prevents the global C_norm from
+    # being dominated by low-alpha contributions (where BZ self and
+    # DOS self differ due to coherent peaks), which would inflate the
+    # distinct term at high alpha where it should be small.
+    # ================================================================
+    sd1 = np.zeros((nbeta, nalpha))
+    n_good_alpha = 0
+    C_norms = []
+    for ia in range(nalpha):
+        sum_ss1_ia = np.sum(ss1[:, ia])
+        sum_raw_self_ia = np.sum(raw_self_grid[:, ia])
+        if sum_raw_self_ia > 1e-30 and sum_ss1_ia > 1e-30:
+            C_ia = sum_ss1_ia / sum_raw_self_ia
+            sd1[:, ia] = C_ia * raw_distinct_grid[:, ia]
+            C_norms.append(C_ia)
+            n_good_alpha += 1
+    if C_norms:
+        C_median = np.median(C_norms)
+        C_min = np.min(C_norms)
+        C_max = np.max(C_norms)
     else:
-        C_norm = 0.0
-    sd1 = C_norm * raw_distinct_grid
-
-    print(f"      Distinct norm: C={C_norm:.6e}, "
-          f"sum_ss1={sum_ss1:.6e}, sum_raw_self={sum_raw_self:.6e}")
+        C_median = C_min = C_max = 0.0
+    print(f"      Per-alpha norm: {n_good_alpha}/{nalpha} good, "
+          f"C median={C_median:.4f}, range=[{C_min:.4f}, {C_max:.4f}]")
+    print(f"      sum(sd1)={np.sum(sd1):.6e}")
 
     # Apply Gaussian smoothing to sd1 along beta axis if requested.
-    # The smoothing width sd1_sigma is in meV; convert to beta units using
-    # kT and the LAT scaling, then to grid-spacing units for the filter.
+    # The smoothing width sd1_sigma is in meV; convert to beta units
+    # using kT and the LAT scaling, then to grid-spacing units.
     if sd1_sigma > 0.0 and nalpha > 0 and nbeta > 1:
         BK = 8.617333262e-5
         THERM = 0.0253
@@ -1305,9 +1351,9 @@ def compute_onephonon_eigvec_euphonic(fc, atom_map, crystal_info,
             for ia in range(nalpha):
                 sd1[:, ia] = _gaussian_smooth(sd1[:, ia], sigma_bins)
             sd1_sum_after = np.sum(sd1)
-            print(f"      Distinct smoothing: sd1_sigma={sd1_sigma:.2f} meV, "
+            print(f"      Smoothing: sd1_sigma={sd1_sigma:.2f} meV, "
                   f"sigma_bins={sigma_bins:.1f}, "
-                  f"sum ratio={sd1_sum_after / sd1_sum_before:.6f}")
+                  f"sd1 ratio={sd1_sum_after / sd1_sum_before:.6f}")
 
     return ss1, sd1
 
@@ -1323,14 +1369,7 @@ def compute_generalized_inelastic(alpha, beta, nalpha, nbeta, lat, arat, tev,
       1. Project DOS tensor onto khat -> directional DOS
       2. Feed through contin() -> full phonon expansion for that direction
       3. Average over all directions -> S_self(alpha, beta)
-    Then add distinct one-phonon from Euphonic sphere sampling.
-
-    Parameters
-    ----------
-    sd1_sigma : float
-        Gaussian smoothing width in meV for the distinct one-phonon channel.
-        Applied along the beta axis of S_d^1 to suppress statistical sampling
-        noise from finite sphere points. Default 0 = no smoothing.
+    Then compute coherent scattering via BZ sphere sampling.
 
     Returns: (ssm_self, sd1, f0, tbar, deltab)
       ssm_self: directional self S(alpha,beta) [nbeta, nalpha]
@@ -1411,7 +1450,7 @@ def compute_generalized_inelastic(alpha, beta, nalpha, nbeta, lat, arat, tev,
           f"ratio={f0_avg / f0_iso:.6f})")
     print(f"      tbar_avg={tbar_avg:.6f} (iso={tbar_iso:.6f})")
 
-    # Step 5: Distinct one-phonon via Euphonic sphere sampling
+    # Step 5: Distinct one-phonon via Euphonic BZ sphere sampling
     _, sd1 = compute_onephonon_eigvec_euphonic(
         fc, atom_map, crystal_info,
         alpha, beta, nalpha, nbeta, lat, arat,
@@ -4692,26 +4731,27 @@ def run_leapr(input_file, output_file):
                     W_principal, awr, tev)
 
                 sd1_sigma_coh = crystal_info.get('coh_inel_sd1_sigma', 0.0)
-                ssm_self, sd1, f0, tbar, deltab = compute_generalized_inelastic(
-                    alpha, beta, nalpha, nbeta, lat, arat, tev,
-                    abs(temp), awr, spr, crystal_info, itemp,
-                    p1, np1, delta1, tbeta, nphon,
-                    _euphonic_fc, _euphonic_atom_map, dw_obj,
-                    ndir=ndir_coh, mesh=mesh_coh,
-                    sd1_sigma=sd1_sigma_coh)
+                ssm_self, sd1, f0, tbar, deltab = \
+                    compute_generalized_inelastic(
+                        alpha, beta, nalpha, nbeta, lat, arat, tev,
+                        abs(temp), awr, spr, crystal_info, itemp,
+                        p1, np1, delta1, tbeta, nphon,
+                        _euphonic_fc, _euphonic_atom_map, dw_obj,
+                        ndir=ndir_coh, mesh=mesh_coh,
+                        sd1_sigma=sd1_sigma_coh)
 
-                # Replace ssm with directional self S(alpha,beta)
-                ssm[:, :, itemp] = ssm_self
-
-                # Add distinct one-phonon weighted by sigma_coh/sigma_b
                 at_principal = crystal_info['atom_types'][principal_idx]
                 sigma_coh_p = 4.0 * pi * (at_principal['b_coh'] / 10.0)**2
                 sigma_b_p = spr * ((1.0 + awr) / awr)**2
+
+                # Assembly: self (all orders) + distinct one-phonon
+                ssm[:, :, itemp] = ssm_self
                 weight_d = sigma_coh_p / sigma_b_p
                 ssm[:, :, itemp] += weight_d * sd1
 
                 sd1_max = np.max(np.abs(sd1))
-                print(f"    S_d^1: max={sd1_max:.6e}, sum={np.sum(sd1):.6e}, "
+                print(f"    S_d^1: max={sd1_max:.6e}, "
+                      f"sum={np.sum(sd1):.6e}, "
                       f"weight(sigma_coh/sigma_b)={weight_d:.6f}")
 
                 # Use Euphonic-derived dwpix
